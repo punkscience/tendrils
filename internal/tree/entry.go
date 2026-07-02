@@ -17,11 +17,20 @@ type Entry struct {
 	// Linux regardless of the local root path.
 	Path string
 
-	// Sha256 is the lowercase-hex SHA-256 of the file's *plaintext* content.
-	// It is the blob's content address on the Blossom server (the blob stored
-	// there is the encrypted form, but files are identified by plaintext hash so
-	// identical content dedupes). Empty for a tombstone.
+	// Sha256 is the lowercase-hex SHA-256 of the file's *plaintext* content. It is
+	// the file's content identity: it drives dedup and the reconciler's
+	// same-content check, and a pulling device verifies decrypted bytes against
+	// it. It is *not* the Blossom address (that is BlobHash) — the stored blob is
+	// the encrypted form, whose hash differs. Empty for a tombstone.
 	Sha256 string
+
+	// BlobHash is the lowercase-hex SHA-256 of the *sealed* (encrypted) bytes as
+	// stored on the Blossom server — the address a device fetches by. Because
+	// encryption uses a random nonce per blob, the same plaintext seals to
+	// different bytes on each device, so this is whatever the publishing device
+	// actually uploaded. Empty for a tombstone and for a freshly scanned local
+	// entry that has not been sealed and uploaded yet.
+	BlobHash string
 
 	// Size is the plaintext byte length. Zero for a tombstone.
 	Size int64

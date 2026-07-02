@@ -20,10 +20,11 @@ func mustID(t *testing.T) *keys.Identity {
 func TestSignParseRoundTripLive(t *testing.T) {
 	id := mustID(t)
 	in := &tree.Entry{
-		Path:    "notes/ideas.md",
-		Sha256:  "abc123",
-		Size:    99,
-		ModTime: time.Unix(1_700_000_000, 0),
+		Path:     "notes/ideas.md",
+		Sha256:   "abc123",
+		BlobHash: "def456",
+		Size:     99,
+		ModTime:  time.Unix(1_700_000_000, 0),
 	}
 	evt, err := Sign(in, id.SecretHex())
 	if err != nil {
@@ -38,6 +39,9 @@ func TestSignParseRoundTripLive(t *testing.T) {
 	}
 	if out.Path != in.Path || out.Sha256 != in.Sha256 || out.Size != in.Size || !out.ModTime.Equal(in.ModTime) {
 		t.Errorf("round-trip mismatch: %+v vs %+v", out, in)
+	}
+	if out.BlobHash != in.BlobHash {
+		t.Errorf("blob hash mismatch: got %q want %q", out.BlobHash, in.BlobHash)
 	}
 	if out.Deleted {
 		t.Errorf("live entry parsed as tombstone")
@@ -59,8 +63,8 @@ func TestSignParseRoundTripTombstone(t *testing.T) {
 	if !out.Deleted {
 		t.Errorf("tombstone did not round-trip as deleted")
 	}
-	if out.Sha256 != "" {
-		t.Errorf("tombstone should carry no hash, got %q", out.Sha256)
+	if out.Sha256 != "" || out.BlobHash != "" {
+		t.Errorf("tombstone should carry no hashes, got x=%q blob=%q", out.Sha256, out.BlobHash)
 	}
 	if out.Path != "old.md" || !out.ModTime.Equal(in.ModTime) {
 		t.Errorf("tombstone metadata mismatch: %+v", out)

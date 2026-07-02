@@ -7,6 +7,9 @@
 //	kind:       KindFileEntry
 //	d tag:      the sync-root-relative path (the replaceable identifier)
 //	x tag:      SHA-256 of the plaintext content (NIP-94 convention); absent on a tombstone
+//	blob tag:   SHA-256 of the sealed (encrypted) bytes — the Blossom fetch
+//	            address, distinct from x because encryption randomizes the bytes;
+//	            absent on a tombstone
 //	size tag:   plaintext byte length; absent on a tombstone
 //	mtime tag:  file modification time as unix seconds (drives last-writer-wins)
 //	deleted tag: present iff this is a tombstone
@@ -53,6 +56,9 @@ func Build(e *tree.Entry) (*nostr.Event, error) {
 			nostr.Tag{"x", e.Sha256},
 			nostr.Tag{"size", strconv.FormatInt(e.Size, 10)},
 		)
+		if e.BlobHash != "" {
+			tags = append(tags, nostr.Tag{"blob", e.BlobHash})
+		}
 	}
 	return &nostr.Event{
 		CreatedAt: nostr.Timestamp(e.ModTime.Unix()),
@@ -100,6 +106,9 @@ func Parse(evt *nostr.Event) (*tree.Entry, error) {
 	}
 	if x := evt.Tags.GetFirst([]string{"x"}); x != nil {
 		e.Sha256 = x.Value()
+	}
+	if b := evt.Tags.GetFirst([]string{"blob"}); b != nil {
+		e.BlobHash = b.Value()
 	}
 	if s := evt.Tags.GetFirst([]string{"size"}); s != nil {
 		e.Size, _ = strconv.ParseInt(s.Value(), 10, 64)
