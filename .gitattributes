@@ -1,0 +1,5 @@
+# Shell scripts must stay LF so they run on Unix regardless of checkout platform.
+*.sh text eol=lf
+# Normalize Go and text sources to LF in the repository.
+*.go text eol=lf
+*.md text eol=lf
