@@ -179,6 +179,52 @@ func TestPublishLocalFile(t *testing.T) {
 	}
 }
 
+// Paths matched by .tendrilsignore are invisible to reconcile: an ignored local
+// file is never published, an ignored remote file is never pulled, and an
+// existing local copy is left untouched.
+func TestSyncSkipsIgnored(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+
+	// A file present only on the relay whose path is ignored must not be pulled.
+	seedRemote(t, ev, bl, id, ".obsidian/workspace.json", "remote ui state", time.Unix(1_700_000_050, 0))
+
+	root := t.TempDir()
+	writeFile(t, root, ".tendrilsignore", ".obsidian/workspace*.json\n.trash/\n", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "note.md", "hello", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, ".trash/old.md", "trashed", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	got, err := ev.Fetch(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]*tree.Entry{}
+	for _, e := range got {
+		ent, err := nostrevent.Parse(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		byPath[ent.Path] = ent
+	}
+	if e, ok := byPath["note.md"]; !ok || e.BlobHash == "" {
+		t.Errorf("note.md not published properly: %+v", e)
+	}
+	if _, ok := byPath[".trash/old.md"]; ok {
+		t.Errorf("ignored local file was published")
+	}
+	if _, ok := readFile(t, root, ".obsidian/workspace.json"); ok {
+		t.Errorf("ignored remote file was pulled to disk")
+	}
+	if got, ok := readFile(t, root, ".trash/old.md"); !ok || got != "trashed" {
+		t.Errorf("ignored local file changed: %q present=%v", got, ok)
+	}
+}
+
 // A file present only on the relay is pulled and written locally.
 func TestPullRemoteFile(t *testing.T) {
 	id := mustID(t)

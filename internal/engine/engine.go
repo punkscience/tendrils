@@ -32,6 +32,7 @@ import (
 
 	"ca.punkscience.tendrils/internal/blob"
 	"ca.punkscience.tendrils/internal/crypt"
+	"ca.punkscience.tendrils/internal/ignore"
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
@@ -102,11 +103,19 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: fetch remote: %w", err)
 	}
+	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
+	// fresh each pass so edits take effect without a restart.
+	ign := e.loadIgnore()
 
 	var errs []error
 	for _, path := range unionPaths(local, base, remote) {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Ignored paths are invisible to reconcile: never published, pulled, or
+		// deleted. Any already-synced copy is left frozen in place, not removed.
+		if ign.Match(path) {
+			continue
 		}
 		d := reconcile.Decide(base[path], local[path], remote[path])
 		if d.Op == reconcile.OpNone {
@@ -288,6 +297,16 @@ func (e *Engine) moveToTrash(path string) error {
 
 func (e *Engine) abs(relSlash string) string {
 	return filepath.Join(e.root, filepath.FromSlash(relSlash))
+}
+
+// loadIgnore reads the sync root's .tendrilsignore into a matcher. A missing or
+// unreadable file yields an empty matcher (nothing ignored).
+func (e *Engine) loadIgnore() *ignore.Matcher {
+	data, err := os.ReadFile(filepath.Join(e.root, ignore.FileName))
+	if err != nil {
+		return ignore.Compile(nil)
+	}
+	return ignore.Compile(strings.Split(string(data), "\n"))
 }
 
 // hashHex is the lowercase-hex SHA-256 of data — the plaintext content identity.
