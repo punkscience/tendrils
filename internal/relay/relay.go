@@ -19,6 +19,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 
 	"ca.punkscience.tendrils/internal/nostrevent"
+	"ca.punkscience.tendrils/internal/serverlist"
 )
 
 // Client talks to a fixed set of relay URLs. Safe for concurrent use.
@@ -104,6 +105,52 @@ func (c *Client) Fetch(ctx context.Context, pubkey string) ([]*nostr.Event, erro
 		return nil, fmt.Errorf("relay: no relay reachable: %w", errors.Join(errs...))
 	}
 	return out, nil
+}
+
+// FetchServerList returns the Blossom servers the owner's key advertises via its
+// kind-10063 event (BUD-03), so a device enrolled with only the key + a relay can
+// discover where blobs live. The newest event across reachable relays wins. It
+// returns (nil, nil) when the key has published no list — an empty result is not
+// an error, only an unreachable relay is.
+func (c *Client) FetchServerList(ctx context.Context, pubkey string) ([]string, error) {
+	if len(c.urls) == 0 {
+		return nil, errors.New("relay: no relays configured")
+	}
+	filter := nostr.Filter{
+		Kinds:   []int{serverlist.Kind},
+		Authors: []string{pubkey},
+		Limit:   1,
+	}
+
+	var newest *nostr.Event
+	var errs []error
+	reached := false
+	for _, url := range c.urls {
+		r, err := c.relay(ctx, url)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", url, err))
+			continue
+		}
+		evts, err := r.QuerySync(ctx, filter)
+		if err != nil {
+			c.drop(url)
+			errs = append(errs, fmt.Errorf("%s: %w", url, err))
+			continue
+		}
+		reached = true
+		for _, e := range evts {
+			if newest == nil || e.CreatedAt > newest.CreatedAt {
+				newest = e
+			}
+		}
+	}
+	if !reached {
+		return nil, fmt.Errorf("relay: no relay reachable: %w", errors.Join(errs...))
+	}
+	if newest == nil {
+		return nil, nil
+	}
+	return serverlist.Parse(newest)
 }
 
 // Close disconnects every open relay connection.

@@ -56,15 +56,30 @@ Other commands: `tendrils status` (pending changes / conflicts). Run `tendrils <
 
 Tendrils is transport-agnostic. You bring a relay and a Blossom server.
 
+> **The one rule that makes multi-device sync work: every device must reach the *same* Blossom server.** The relay only carries the tiny "what changed" events (paths and hashes); the file *bytes* live on Blossom. If each device points at its own local Blossom, the metadata will sync and it will *look* like it's working, but a second device can never fetch the bytes — it's asking an empty server for hashes that live somewhere else. Pick one Blossom server all your devices can reach (a box on your LAN, a small VPS, a tunnelled home server, or a public one) and point every device at it. After the first device is running, later devices can **discover** that server automatically (see below) and be enrolled with just `--key` and `--relay`.
+
 - **Nostr relay** — any relay your key can publish to. Public relays (e.g. `wss://nos.lol`) work, but note that event *paths* (not contents) are visible to the relay operator, so a private/self-hosted relay is recommended for privacy. Many relays enforce a write allowlist — add your key's pubkey there.
 - **Blossom server** — stores the encrypted blobs. Use a public Blossom server, or self-host the minimal reference server included here:
 
   ```sh
   go build -o blossomd ./cmd/blossomd
-  BLOSSOM_ADDR=127.0.0.1:8091 BLOSSOM_DIR=~/.tendrils-blobs ./blossomd
+  # LAN/localhost, no auth — fine when only trusted machines can reach it:
+  BLOSSOM_ADDR=0.0.0.0:8091 BLOSSOM_DIR=~/.tendrils-blobs ./blossomd
   ```
 
-  `blossomd` is intentionally minimal and **does not authenticate uploads** — run it on localhost or a trusted LAN (set `BLOSSOM_ADDR=0.0.0.0:8091` to expose it on your network). Blobs are encrypted regardless, but treat it as personal infrastructure, not a public endpoint.
+  By default `blossomd` **does not authenticate** — anyone who can reach it may upload or download. That is fine on localhost or a trusted LAN. **Before exposing it to the public internet** (e.g. behind a reverse proxy or tunnel so remote devices can reach it), turn on the pubkey allowlist so only your key can use it — otherwise the open server can be filled with junk:
+
+  ```sh
+  BLOSSOM_ADDR=0.0.0.0:8091 \
+  BLOSSOM_ALLOWED_PUBKEYS=npub1yourkey... \
+  ./blossomd
+  ```
+
+  With the allowlist set, the server verifies the signed authorization every Tendrils client already sends and rejects everyone else. Blobs are encrypted regardless, but auth is what keeps a public endpoint from being abused.
+
+### Discovery (enrolling later devices with just the key)
+
+The first device you run publishes its Blossom server list to the relay under your key (a [BUD-03](https://github.com/hzrd149/blossom/blob/master/buds/03.md) kind-10063 event). A later device enrolled with only `--key` and `--relay` (no `--blossom`) reads that list and learns where the blobs live — so you only have to name the server once. Loopback addresses (`127.0.0.1`, `localhost`) are never advertised, since no other device could reach them; give the first device the server's real LAN or public address.
 
 ## Ignoring files
 
@@ -95,8 +110,8 @@ Because encryption uses a random nonce per blob, the same file seals to differen
 Setting this up for a user, non-interactively:
 
 1. **Install**: run the platform installer above (needs Go 1.26+ and git on PATH). Binary lands in `~/.local/bin/tendrils` (Linux/macOS) or `%LOCALAPPDATA%\Programs\tendrils\tendrils.exe` (Windows). Override the target dir with `TENDRILS_BIN_DIR`.
-2. **Transport**: ensure a relay and Blossom server are reachable. For a fully self-hosted local setup, run `blossomd` (from this repo) and point at any relay the user's key can write to.
-3. **Enroll each device with the same key**: `tendrils enroll --key <nsec> --root <folder> --relay <wss/ws url> --blossom <http url>`. `--key` may be omitted after the first enroll (the key is stored `0600` in the state dir).
+2. **Transport**: ensure a relay and **one shared Blossom server that every device can reach** are up. A per-device *localhost* Blossom does **not** work for multi-device sync — the second device would fetch blobs from its own empty server. Run one `blossomd` on a host all devices can reach (bind `0.0.0.0`; if it's public, set `BLOSSOM_ALLOWED_PUBKEYS` to the user's pubkey) and point every device at that same URL.
+3. **Enroll each device with the same key**: `tendrils enroll --key <nsec> --root <folder> --relay <wss/ws url> --blossom <http url>`. `--key` may be omitted after the first enroll (the key is stored `0600` in the state dir). `--blossom` may be omitted on **later** devices: once the first device has run its daemon, the Blossom server is discovered from the relay.
 4. **Run continuously**: `tendrils daemon --interval 1m`. Register it as a service so it survives reboot — e.g. a `systemd --user` unit on Linux, or a Startup-folder launcher on Windows.
 5. **State locations**: config/key/index live in `$TENDRILS_HOME` if set, else the OS config dir (`~/.config/tendrils`, `%AppData%\tendrils`). Set `TENDRILS_HOME` to isolate multiple instances.
 
@@ -106,7 +121,7 @@ Everything is flag- and env-driven; there are no interactive prompts.
 
 - The `nsec` is the master secret: whoever holds it can read all synced files and enroll new devices. **Back it up**; if lost with no backup, the encrypted blobs are unrecoverable.
 - The relay sees event metadata including **file paths** (not contents). Self-host or use a private relay if paths are sensitive.
-- `blossomd` does not authenticate — keep it local/LAN. Blobs are always encrypted at rest.
+- `blossomd` does not authenticate by default — keep it local/LAN, or set `BLOSSOM_ALLOWED_PUBKEYS` to your key's pubkey before exposing it publicly. Blobs are always encrypted at rest regardless.
 
 ## Build & test
 
