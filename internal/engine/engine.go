@@ -191,6 +191,9 @@ func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entr
 	}
 	sealed, err := e.blobs.Download(ctx, remote.BlobHash)
 	if err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return fmt.Errorf("blob %s… for %q is not on the configured Blossom server: this device is likely pointed at a different or empty server than the one holding your files — check --blossom / the blossom_servers in your config", short(remote.BlobHash), path)
+		}
 		return fmt.Errorf("download: %w", err)
 	}
 	plaintext, err := crypt.Open(e.symKey, sealed)
@@ -307,6 +310,14 @@ func (e *Engine) loadIgnore() *ignore.Matcher {
 		return ignore.Compile(nil)
 	}
 	return ignore.Compile(strings.Split(string(data), "\n"))
+}
+
+// short trims a hex hash to a readable prefix for error messages.
+func short(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }
 
 // hashHex is the lowercase-hex SHA-256 of data — the plaintext content identity.

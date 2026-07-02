@@ -15,6 +15,7 @@ import (
 
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
+	"ca.punkscience.tendrils/internal/serverlist"
 	"ca.punkscience.tendrils/internal/tree"
 )
 
@@ -232,6 +233,48 @@ func TestPublishToleratesDownRelay(t *testing.T) {
 	evt := signEntry(t, id, &tree.Entry{Path: "a.md", Sha256: "h", ModTime: time.Unix(1, 0)})
 	if err := c.Publish(ctx, evt); err != nil {
 		t.Errorf("publish should succeed via the reachable relay, got: %v", err)
+	}
+}
+
+// A device publishes its Blossom server list; another device with only the key
+// and the relay discovers where blobs live via FetchServerList.
+func TestFetchServerListRoundTrip(t *testing.T) {
+	url, _ := newTestRelay(t)
+	id := mustID(t)
+	c := New([]string{url})
+	defer c.Close()
+	ctx := context.Background()
+
+	evt, err := serverlist.Sign([]string{"https://blossom.towerofsong.ca"}, id.SecretHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(ctx, evt); err != nil {
+		t.Fatalf("publish server list: %v", err)
+	}
+
+	got, err := c.FetchServerList(ctx, id.PublicHex())
+	if err != nil {
+		t.Fatalf("fetch server list: %v", err)
+	}
+	if len(got) != 1 || got[0] != "https://blossom.towerofsong.ca" {
+		t.Fatalf("discovered %v, want [https://blossom.towerofsong.ca]", got)
+	}
+}
+
+// No published list is an empty result, not an error.
+func TestFetchServerListEmpty(t *testing.T) {
+	url, _ := newTestRelay(t)
+	id := mustID(t)
+	c := New([]string{url})
+	defer c.Close()
+
+	got, err := c.FetchServerList(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no servers, got %v", got)
 	}
 }
 
