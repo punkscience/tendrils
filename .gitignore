@@ -1,0 +1,21 @@
+# Compiled binaries
+/tendrils
+/tendrils.exe
+/blossomd
+/blossomd.exe
+/cmd/tendrils/tendrils
+/cmd/blossomd/blossomd
+bin/
+dist/
+
+# Go test / coverage output
+*.out
+*.test
+
+# Local runtime state (bbolt index, blob store)
+*.db
+/blobs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
