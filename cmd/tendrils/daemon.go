@@ -154,6 +154,10 @@ func runLoop(ctx context.Context, idxPath, root string, id *keys.Identity, blobs
 		}
 		defer idx.Close()
 
+		// engine.New is cheap: it allocates a small struct and derives the
+		// symmetric key via HKDF (microseconds). The stateful, expensive
+		// resources (relay connections, HTTP client) are created once outside
+		// the loop and reused across passes.
 		eng, err := engine.New(root, id, idx, blobs, relays, log)
 		if err != nil {
 			log.Error("create engine", "err", err)

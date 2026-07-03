@@ -52,6 +52,11 @@ func Open(path string) (*Store, error) {
 // which does not acquire an exclusive lock and therefore succeeds even when
 // the daemon has the database open. If path does not exist (no syncs have
 // run yet), it returns (nil, nil); callers must check for a nil *Store.
+//
+// A one-second timeout is used: status is a quick informational query and
+// should fail fast (with a clear error) rather than block for several
+// seconds if a sync pass happens to run concurrently. Retry once the pass
+// completes.
 func OpenReadOnly(path string) (*Store, error) {
 	db, err := bbolt.Open(path, 0o600, &bbolt.Options{
 		ReadOnly: true,
