@@ -6,7 +6,9 @@ package index
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -42,6 +44,24 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("index: init buckets: %w", err)
+	}
+	return &Store{db: db}, nil
+}
+
+// OpenReadOnly opens an existing index database at path in read-only mode,
+// which does not acquire an exclusive lock and therefore succeeds even when
+// the daemon has the database open. If path does not exist (no syncs have
+// run yet), it returns (nil, nil); callers must check for a nil *Store.
+func OpenReadOnly(path string) (*Store, error) {
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{
+		ReadOnly: true,
+		Timeout:  1 * time.Second,
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	return &Store{db: db}, nil
 }

@@ -52,11 +52,13 @@ func newDaemonCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			idx, err := index.Open(idxPath)
-			if err != nil {
+			// Probe the path is usable before starting the loop; this surfaces
+			// permission or path errors early rather than at the first sync tick.
+			if idx, err := index.Open(idxPath); err != nil {
 				return err
+			} else {
+				idx.Close()
 			}
-			defer idx.Close()
 
 			relays := relay.New(cfg.Relays)
 			defer relays.Close()
@@ -75,10 +77,6 @@ func newDaemonCmd() *cobra.Command {
 
 			// Blossom multi-server mirroring is out of v1 scope; use the first.
 			blobs := blob.New(cfg.BlossomServers[0], id)
-			eng, err := engine.New(cfg.SyncRoot, id, idx, blobs, relays, log)
-			if err != nil {
-				return err
-			}
 
 			npub, _ := id.Npub()
 			out := cmd.OutOrStdout()
@@ -90,7 +88,7 @@ func newDaemonCmd() *cobra.Command {
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
 
-			return runLoop(ctx, eng, interval, log)
+			return runLoop(ctx, idxPath, cfg.SyncRoot, id, blobs, relays, interval, log)
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", time.Minute, "how often to reconcile against the relay")
@@ -143,8 +141,24 @@ func resolveBlossom(ctx context.Context, cfg *config.Config, id *keys.Identity, 
 // runLoop reconciles once immediately (startup catch-up / bootstrap) and then on
 // the interval, until the context is cancelled (Ctrl-C). A failed pass is logged
 // and the loop continues; pending changes stay queued in the working tree.
-func runLoop(ctx context.Context, eng *engine.Engine, interval time.Duration, log *slog.Logger) error {
+//
+// The index database is opened at the start of each sync pass and closed when
+// the pass completes, so that commands like "tendrils status" can read the index
+// between passes without waiting on a file lock.
+func runLoop(ctx context.Context, idxPath, root string, id *keys.Identity, blobs *blob.Client, relays *relay.Client, interval time.Duration, log *slog.Logger) error {
 	sync := func() {
+		idx, err := index.Open(idxPath)
+		if err != nil {
+			log.Error("open index", "err", err)
+			return
+		}
+		defer idx.Close()
+
+		eng, err := engine.New(root, id, idx, blobs, relays, log)
+		if err != nil {
+			log.Error("create engine", "err", err)
+			return
+		}
 		if err := eng.Sync(ctx); err != nil {
 			log.Error("reconcile pass failed", "err", err)
 		} else {

@@ -63,6 +63,64 @@ func TestAllIncludesTombstones(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyMissingFileReturnsNil(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nonexistent.db")
+	s, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("expected nil error for missing file, got: %v", err)
+	}
+	if s != nil {
+		s.Close()
+		t.Fatal("expected nil store for missing file")
+	}
+}
+
+func TestOpenReadOnlyReadsExistingData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	at := time.Unix(1700001234, 0)
+
+	// Write data and close (releases the exclusive lock).
+	rw, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := rw.SetLastReconcile(at); err != nil {
+		t.Fatalf("SetLastReconcile: %v", err)
+	}
+	if err := rw.Put(&tree.Entry{Path: "a.md", Sha256: "abc"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	rw.Close()
+
+	// Open read-only after the write-open is closed — must succeed and return
+	// the recorded data. This is the normal scenario: the daemon closes the
+	// index between sync passes, then the status command opens it read-only.
+	ro, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	if ro == nil {
+		t.Fatal("expected non-nil store")
+	}
+	defer ro.Close()
+
+	got, err := ro.LastReconcile()
+	if err != nil {
+		t.Fatalf("LastReconcile: %v", err)
+	}
+	if !got.Equal(at) {
+		t.Errorf("LastReconcile = %v, want %v", got, at)
+	}
+
+	all, err := ro.All()
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(all) != 1 || all["a.md"] == nil {
+		t.Errorf("All = %v, want {a.md}", all)
+	}
+}
+
 func TestLastReconcilePersistsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "index.db")

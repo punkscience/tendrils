@@ -60,8 +60,12 @@ func localStatus(root string) (last time.Time, pending, conflicts int, err error
 	if err != nil {
 		return
 	}
-	store, err := index.Open(idxPath)
+	store, err := index.OpenReadOnly(idxPath)
 	if err != nil {
+		return
+	}
+	if store == nil {
+		// Database does not exist yet — no syncs have run.
 		return
 	}
 	defer store.Close()
