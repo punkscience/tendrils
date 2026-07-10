@@ -20,7 +20,7 @@
 //	BLOSSOM_ADDR             listen address (default 127.0.0.1:8091)
 //	BLOSSOM_DIR              blob storage directory (default ./blobs)
 //	BLOSSOM_ALLOWED_PUBKEYS  comma-separated npub/hex pubkeys allowed to
-//	                         upload and fetch; empty = open (no auth)
+//	                         upload, fetch, and delete; empty = open (no auth)
 package main
 
 import (
@@ -117,6 +117,26 @@ func main() {
 			_, _ = io.Copy(w, f)
 			log.Printf("GET /%s (%d bytes)", h, info.Size())
 
+		case http.MethodDelete:
+			if err := authorize(r, allowed, "delete"); err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			h := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), ".", 2)[0]
+			if len(h) != 64 {
+				http.NotFound(w, r)
+				return
+			}
+			switch err := os.Remove(filepath.Join(dir, h)); {
+			case err == nil:
+				log.Printf("DELETE /%s", h)
+				w.WriteHeader(http.StatusOK)
+			case os.IsNotExist(err):
+				w.WriteHeader(http.StatusOK) // idempotent: already gone
+			default:
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -130,7 +150,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-// authorize enforces the pubkey allowlist for one verb ("upload"/"get"). When no
+// authorize enforces the pubkey allowlist for one verb ("upload"/"get"/"delete"). When no
 // keys are configured it is a no-op (open server). Otherwise it requires the
 // BUD-01 "Nostr <base64-event>" Authorization header the Tendrils blob client
 // sends: a kind-24242 event with a valid signature from an allowed pubkey, a
