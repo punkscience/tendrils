@@ -19,3 +19,7 @@ dist/
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+
+# Claude Code local settings and its transient temp files
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*

@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,10 +69,25 @@ type Client struct {
 	http   *http.Client
 }
 
-// New returns a Client for server, authorizing as id, using a default HTTP
-// client with a sane timeout.
+// New returns a Client for server, authorizing as id. Its HTTP client uses
+// granular transport timeouts rather than a single overall deadline: a blanket
+// http.Client.Timeout caps the *whole* request including the body transfer, so a
+// large blob (a multi-megabyte file) fails the moment it exceeds the cap no
+// matter how healthily it is streaming. Instead we bound only the stall points —
+// connect, TLS handshake, and the wait for response headers — and let the body
+// stream for as long as it makes progress. The per-request context carries the
+// hard cap when a caller wants one.
 func New(server string, id *keys.Identity) *Client {
-	return NewWithHTTP(server, id, &http.Client{Timeout: 30 * time.Second})
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          10,
+	}
+	return NewWithHTTP(server, id, &http.Client{Transport: transport})
 }
 
 // NewWithHTTP is New with a caller-supplied *http.Client (for tests, custom

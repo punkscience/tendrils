@@ -80,6 +80,15 @@ func newDaemonCmd() *cobra.Command {
 				return err
 			}
 
+			// The daemon holds the index lock for its whole life, so it is the
+			// only process that can read the base — expose a loopback endpoint so
+			// `tendrils status` can query it instead of failing on the lock.
+			state := &syncState{}
+			eng.OnProgress(state.setProgress)
+			eng.OnStats(state.setStats)
+			stopStatus := serveStatus(&statusServer{id: id, cfg: &cfg, idx: idx, state: state}, log)
+			defer stopStatus()
+
 			npub, _ := id.Npub()
 			out := cmd.OutOrStdout()
 			fmt.Fprintln(out, "Tendrils daemon starting:")
@@ -90,7 +99,7 @@ func newDaemonCmd() *cobra.Command {
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
 
-			return runLoop(ctx, eng, interval, log)
+			return runLoop(ctx, eng, interval, log, state)
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", time.Minute, "how often to reconcile against the relay")
@@ -143,9 +152,12 @@ func resolveBlossom(ctx context.Context, cfg *config.Config, id *keys.Identity, 
 // runLoop reconciles once immediately (startup catch-up / bootstrap) and then on
 // the interval, until the context is cancelled (Ctrl-C). A failed pass is logged
 // and the loop continues; pending changes stay queued in the working tree.
-func runLoop(ctx context.Context, eng *engine.Engine, interval time.Duration, log *slog.Logger) error {
+func runLoop(ctx context.Context, eng *engine.Engine, interval time.Duration, log *slog.Logger, state *syncState) error {
 	sync := func() {
-		if err := eng.Sync(ctx); err != nil {
+		state.begin()
+		err := eng.Sync(ctx)
+		state.end(err)
+		if err != nil {
 			log.Error("reconcile pass failed", "err", err)
 		} else {
 			log.Info("reconcile pass complete")

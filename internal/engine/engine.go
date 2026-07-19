@@ -55,15 +55,60 @@ type BlobStore interface {
 	Download(ctx context.Context, sha256 string) ([]byte, error)
 }
 
+// Progress is the engine's position within a Sync pass, emitted to the callback
+// registered with OnProgress so a UI or the status endpoint can show live work.
+// It is file-granular: which action, out of how many, on which path.
+type Progress struct {
+	Done  int    // actions completed so far this pass
+	Total int    // actions planned for this pass
+	Path  string // the path being acted on now; empty when the pass is finished
+	Op    string // human verb for the current action: "uploading", "downloading", ...
+}
+
 // Engine holds the wiring for one synced folder on one device.
 type Engine struct {
-	root   string
-	id     *keys.Identity
-	symKey [32]byte
-	idx    *index.Store
-	blobs  BlobStore
-	events EventStore
-	log    *slog.Logger
+	root        string
+	id          *keys.Identity
+	symKey      [32]byte
+	idx         *index.Store
+	blobs       BlobStore
+	events      EventStore
+	log         *slog.Logger
+	report      func(Progress)
+	statsReport func(pending, conflicts int)
+}
+
+// OnProgress registers a callback invoked as each planned action begins and once
+// more when the pass finishes (Path empty, Done==Total). Optional; nil disables
+// reporting. It is called synchronously from Sync's goroutine — keep it cheap and
+// non-blocking.
+func (e *Engine) OnProgress(fn func(Progress)) { e.report = fn }
+
+func (e *Engine) reportProgress(p Progress) {
+	if e.report != nil {
+		e.report(p)
+	}
+}
+
+// OnStats registers a callback given, once per pass, the number of pending local
+// changes (files to upload or tombstone) and conflict copies awaiting the owner.
+// The engine has both in hand from the pass's scan and plan, so a status query
+// can report them without an expensive rescan of its own. Optional; nil disables.
+func (e *Engine) OnStats(fn func(pending, conflicts int)) { e.statsReport = fn }
+
+func (e *Engine) reportStats(pending, conflicts int) {
+	if e.statsReport != nil {
+		e.statsReport(pending, conflicts)
+	}
+}
+
+// plannedAction is one path the reconciler decided needs work, captured up front
+// so the pass knows its total before executing (that count is what "3 of 12" needs).
+type plannedAction struct {
+	path     string
+	decision reconcile.Decision
+	local    *tree.Entry
+	remote   *tree.Entry
 }
 
 // New builds an Engine. It derives the blob-encryption key from id up front so
@@ -91,13 +136,15 @@ func New(root string, id *keys.Identity, idx *index.Store, blobs BlobStore, even
 // or on the relay. Per-path failures are collected and joined, not fatal: one
 // unreadable file or unreachable blob must not stall the rest of the tree.
 func (e *Engine) Sync(ctx context.Context) error {
-	local, err := scan.Tree(e.root)
-	if err != nil {
-		return fmt.Errorf("engine: scan: %w", err)
-	}
 	base, err := e.idx.All()
 	if err != nil {
 		return fmt.Errorf("engine: read index: %w", err)
+	}
+	// The base doubles as the scan's mtime+size cache: unchanged files are not
+	// re-hashed, so a pass over a large tree costs a stat per file, not a full read.
+	local, err := scan.Tree(e.root, base)
+	if err != nil {
+		return fmt.Errorf("engine: scan: %w", err)
 	}
 	remote, err := e.fetchRemote(ctx)
 	if err != nil {
@@ -107,7 +154,9 @@ func (e *Engine) Sync(ctx context.Context) error {
 	// fresh each pass so edits take effect without a restart.
 	ign := e.loadIgnore()
 
-	var errs []error
+	// Plan first, so the total is known before any action runs — that count is
+	// what turns per-file progress into "3 of 12".
+	var plan []plannedAction
 	for _, path := range unionPaths(local, base, remote) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -121,17 +170,70 @@ func (e *Engine) Sync(ctx context.Context) error {
 		if d.Op == reconcile.OpNone {
 			continue
 		}
-		e.log.Info("reconcile", "path", path, "op", d.Op.String(), "reason", d.Reason)
-		if err := e.execute(ctx, path, d, local[path], remote[path]); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", path, err))
-			e.log.Error("action failed", "path", path, "op", d.Op.String(), "err", err)
+		plan = append(plan, plannedAction{path: path, decision: d, local: local[path], remote: remote[path]})
+	}
+
+	// Publish the pass's outstanding-work counts for the status endpoint, so a
+	// query reports these from the pass the daemon already ran rather than paying
+	// for its own full-tree rescan. Pending = local changes to push; conflicts =
+	// conflict copies sitting in the tree.
+	e.reportStats(passStats(local, plan))
+
+	total := len(plan)
+	var errs []error
+	for i, a := range plan {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		e.reportProgress(Progress{Done: i, Total: total, Path: a.path, Op: verb(a.decision.Op)})
+		e.log.Info("reconcile", "path", a.path, "op", a.decision.Op.String(), "reason", a.decision.Reason)
+		if err := e.execute(ctx, a.path, a.decision, a.local, a.remote); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", a.path, err))
+			e.log.Error("action failed", "path", a.path, "op", a.decision.Op.String(), "err", err)
 		}
 	}
+	e.reportProgress(Progress{Done: total, Total: total}) // pass finished, idle
 
 	if err := e.idx.SetLastReconcile(time.Now()); err != nil {
 		errs = append(errs, fmt.Errorf("record last-reconcile: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// passStats derives the status counts from a pass's scan and plan: pending is the
+// number of local changes to push (uploads and tombstones, conflict copies
+// aside), conflicts the number of conflict copies present in the tree.
+func passStats(local map[string]*tree.Entry, plan []plannedAction) (pending, conflicts int) {
+	for path := range local {
+		if scan.IsConflictCopy(path) {
+			conflicts++
+		}
+	}
+	for _, a := range plan {
+		if scan.IsConflictCopy(a.path) {
+			continue
+		}
+		if a.decision.Op == reconcile.OpPublishLocal || a.decision.Op == reconcile.OpPublishDelete {
+			pending++
+		}
+	}
+	return pending, conflicts
+}
+
+// verb is the human-facing present participle for an action, shown in progress.
+func verb(op reconcile.Op) string {
+	switch op {
+	case reconcile.OpPublishLocal:
+		return "uploading"
+	case reconcile.OpWriteRemote:
+		return "downloading"
+	case reconcile.OpDeleteLocal:
+		return "trashing"
+	case reconcile.OpPublishDelete:
+		return "publishing deletion"
+	default:
+		return op.String()
+	}
 }
 
 // execute performs the reconciler's chosen action for one path.
@@ -363,7 +465,7 @@ func atomicWrite(abs string, data []byte, mtime time.Time) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".tendrils-tmp-*")
+	tmp, err := os.CreateTemp(dir, scan.TempPrefix+"*")
 	if err != nil {
 		return err
 	}

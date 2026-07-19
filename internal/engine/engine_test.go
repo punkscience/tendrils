@@ -147,6 +147,91 @@ func mustID(t *testing.T) *keys.Identity {
 	return id
 }
 
+// Sync reports per-file progress: one callback as each planned action begins,
+// counting up to a stable total, then a final idle report with no current path.
+func TestProgressReporting(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	writeFile(t, root, "a.md", "one", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "b.md", "two", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "c.md", "three", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	var seen []Progress
+	eng.OnProgress(func(p Progress) { seen = append(seen, p) })
+
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// Three publishes plus the final idle report.
+	if len(seen) != 4 {
+		t.Fatalf("expected 4 progress reports, got %d: %+v", len(seen), seen)
+	}
+	for i, p := range seen[:3] {
+		if p.Total != 3 {
+			t.Errorf("report %d: total=%d want 3", i, p.Total)
+		}
+		if p.Done != i {
+			t.Errorf("report %d: done=%d want %d", i, p.Done, i)
+		}
+		if p.Path == "" || p.Op != "uploading" {
+			t.Errorf("report %d: path=%q op=%q, want a path and \"uploading\"", i, p.Path, p.Op)
+		}
+	}
+	if final := seen[3]; final.Done != 3 || final.Total != 3 || final.Path != "" {
+		t.Errorf("final report = %+v, want {Done:3 Total:3 Path:\"\"}", final)
+	}
+}
+
+// A pass with nothing to do still emits a single idle report, so a UI can clear
+// any stale "in progress" line.
+func TestProgressNoActions(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	eng := newEngine(t, t.TempDir(), id, ev, bl)
+
+	var seen []Progress
+	eng.OnProgress(func(p Progress) { seen = append(seen, p) })
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(seen) != 1 || seen[0].Total != 0 || seen[0].Path != "" {
+		t.Fatalf("expected one idle report, got %+v", seen)
+	}
+}
+
+// OnStats reports the outstanding-work counts a pass computed for free: two
+// local-only files to push, and one conflict copy sitting in the tree (which is
+// counted as a conflict, not double-counted as pending).
+func TestStatsReporting(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	writeFile(t, root, "a.md", "one", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "b.md", "two", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "c"+scan.ConflictMarker+"deadbeef.md", "conflict", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	var pending, conflicts int
+	var calls int
+	eng.OnStats(func(p, c int) { pending, conflicts, calls = p, c, calls+1 })
+
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("OnStats called %d times, want 1 per pass", calls)
+	}
+	if pending != 2 {
+		t.Errorf("pending = %d, want 2 (a.md, b.md)", pending)
+	}
+	if conflicts != 1 {
+		t.Errorf("conflicts = %d, want 1", conflicts)
+	}
+}
+
 // A local-only file is sealed, uploaded, and published on Sync.
 func TestPublishLocalFile(t *testing.T) {
 	id := mustID(t)

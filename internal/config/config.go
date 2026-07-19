@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	configFile = "config.json"
-	keyFile    = "key"
-	indexFile  = "index.db"
+	configFile     = "config.json"
+	keyFile        = "key"
+	indexFile      = "index.db"
+	daemonAddrFile = "daemon.addr"
 	// envHome overrides the state directory, for tests and power users.
 	envHome = "TENDRILS_HOME"
 )
@@ -70,6 +71,18 @@ func IndexPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, indexFile), nil
+}
+
+// DaemonAddrPath returns the path to the file where a running daemon records the
+// loopback address of its status endpoint. Its absence means no daemon is
+// running; a stale file (from a crash) is harmless because the CLI dial-probes
+// the address before trusting it.
+func DaemonAddrPath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, daemonAddrFile), nil
 }
 
 // Load reads the local config file. A missing file is not an error: it returns
