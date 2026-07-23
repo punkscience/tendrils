@@ -3,15 +3,24 @@
 // with the symmetric key derived from the owner's Nostr key (see internal/keys).
 //
 // A sealed blob is self-describing: [12-byte nonce][AES-256-GCM ciphertext].
-// The nonce is random per blob, so encrypting the same bytes twice yields
-// different ciphertext — a passive observer on the Blossom server cannot tell
-// two identical files apart.
+//
+// Sealing is deterministic: the nonce is derived from the plaintext (keyed), so
+// the same file under the same key always produces the same bytes and therefore
+// the same Blossom content address. That is what stops two devices which copy in
+// the same file from each uploading a distinct blob of it — with a random nonce
+// they never converge, because the address is unpredictable until after sealing.
+//
+// The tradeoff is the standard one for deterministic encryption: someone with
+// access to the Blossom server can see that two blobs hold identical plaintext.
+// The nonce is keyed, so that equality never spans identities — only an owner's
+// own blobs are comparable, and they already sit together behind one pubkey.
 package crypt
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 )
@@ -19,18 +28,35 @@ import (
 // nonceSize is the standard GCM nonce length in bytes.
 const nonceSize = 12
 
+// nonceDomain separates this derivation from any other use of the same key.
+const nonceDomain = "tendrils/crypt/nonce/v1"
+
 // Seal encrypts plaintext under key, returning nonce||ciphertext.
 func Seal(key [32]byte, plaintext []byte) ([]byte, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, nonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("crypt: read nonce: %w", err)
-	}
 	// Seal appends the ciphertext to nonce, so the nonce prefixes the result.
+	nonce := deriveNonce(key, plaintext)
 	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// deriveNonce computes the synthetic nonce for one plaintext — the SIV-style
+// construction that makes sealing deterministic without reusing a nonce across
+// different plaintexts (which under GCM would leak their XOR and, worse, the
+// authentication key). Equal nonces imply equal plaintext up to an HMAC
+// collision truncated to 96 bits, which at any realistic file count is far below
+// the chance of a disk returning the wrong bytes.
+//
+// It is keyed rather than a bare hash of the plaintext, so the nonce reveals
+// nothing to anyone without the owner's key — including whether two *different*
+// owners hold the same file.
+func deriveNonce(key [32]byte, plaintext []byte) []byte {
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte(nonceDomain))
+	mac.Write(plaintext)
+	return mac.Sum(nil)[:nonceSize:nonceSize]
 }
 
 // Open reverses Seal. It returns an error if the blob is malformed or if the

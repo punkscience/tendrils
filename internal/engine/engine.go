@@ -53,6 +53,7 @@ type EventStore interface {
 type BlobStore interface {
 	Upload(ctx context.Context, data []byte) (blob.Descriptor, error)
 	Download(ctx context.Context, sha256 string) ([]byte, error)
+	Has(ctx context.Context, sha256 string) (bool, error)
 }
 
 // Progress is the engine's position within a Sync pass, emitted to the callback
@@ -264,9 +265,9 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 	if err != nil {
 		return fmt.Errorf("seal: %w", err)
 	}
-	desc, err := e.blobs.Upload(ctx, sealed)
+	blobHash, err := e.uploadIfAbsent(ctx, sealed)
 	if err != nil {
-		return fmt.Errorf("upload: %w", err)
+		return err
 	}
 
 	// Re-hash from the bytes we just read so the published identity matches what
@@ -274,7 +275,7 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 	entry := &tree.Entry{
 		Path:     local.Path,
 		Sha256:   local.Sha256,
-		BlobHash: desc.SHA256,
+		BlobHash: blobHash,
 		Size:     int64(len(plaintext)),
 		ModTime:  local.ModTime,
 	}
@@ -282,6 +283,29 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 		return err
 	}
 	return e.idx.Put(entry)
+}
+
+// uploadIfAbsent stores sealed and returns its content address, skipping the
+// transfer when the server already holds it. Because sealing is deterministic,
+// two devices that copy in the same file derive the same address, so the second
+// one gets to skip a redundant upload rather than push a duplicate of bytes the
+// server already has — the win is bandwidth; the address would coincide anyway.
+//
+// A failed existence check is not fatal: it only costs us the optimisation, and
+// re-uploading identical bytes to the same address is harmless.
+func (e *Engine) uploadIfAbsent(ctx context.Context, sealed []byte) (string, error) {
+	want := hashHex(sealed)
+	switch present, err := e.blobs.Has(ctx, want); {
+	case err != nil:
+		e.log.Debug("blob presence check failed, uploading anyway", "blob", short(want), "err", err)
+	case present:
+		return want, nil
+	}
+	desc, err := e.blobs.Upload(ctx, sealed)
+	if err != nil {
+		return "", fmt.Errorf("upload: %w", err)
+	}
+	return desc.SHA256, nil
 }
 
 // writeRemote pulls the remote blob, unseals it, and writes it to disk. If the

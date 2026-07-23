@@ -42,18 +42,27 @@ func (f *fakeEvents) Fetch(_ context.Context, _ string) ([]*nostr.Event, error) 
 	return out, nil
 }
 
-// fakeBlobs is an in-memory Blossom server addressed by content hash.
+// fakeBlobs is an in-memory Blossom server addressed by content hash. It counts
+// uploads so tests can assert that redundant ones are skipped, not merely that
+// the stored set ended up deduplicated by content address.
 type fakeBlobs struct {
-	data map[string][]byte
+	data    map[string][]byte
+	uploads int
 }
 
 func newFakeBlobs() *fakeBlobs { return &fakeBlobs{data: map[string][]byte{}} }
 
 func (f *fakeBlobs) Upload(_ context.Context, data []byte) (blob.Descriptor, error) {
+	f.uploads++
 	sum := hashHex(data)
 	cp := append([]byte(nil), data...)
 	f.data[sum] = cp
 	return blob.Descriptor{SHA256: sum, Size: int64(len(data)), URL: "mem://" + sum}, nil
+}
+
+func (f *fakeBlobs) Has(_ context.Context, sha256 string) (bool, error) {
+	_, ok := f.data[sha256]
+	return ok, nil
 }
 
 func (f *fakeBlobs) Download(_ context.Context, sha256 string) ([]byte, error) {
@@ -350,6 +359,37 @@ func TestTwoDeviceConvergence(t *testing.T) {
 	got, ok := readFile(t, rootB, "shared/note.md")
 	if !ok || got != "written on A" {
 		t.Errorf("B has %q (present=%v), want %q", got, ok, "written on A")
+	}
+}
+
+// Two devices that copy in the same file before either has synced both plan a
+// publish, but deterministic sealing gives them the same blob address, so the
+// second finds it already present and skips the upload. One blob, one transfer.
+func TestSimultaneousPublishUploadsOneBlob(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	mtime := time.Unix(1_700_000_300, 0)
+
+	rootA := t.TempDir()
+	writeFile(t, rootA, "notes/same.md", "identical content", mtime)
+	rootB := t.TempDir()
+	writeFile(t, rootB, "notes/same.md", "identical content", mtime)
+
+	// Neither device has synced, so both see remote==nil and decide to publish.
+	engA := newEngine(t, rootA, id, ev, bl)
+	engB := newEngine(t, rootB, id, ev, bl)
+	if err := engA.Sync(context.Background()); err != nil {
+		t.Fatalf("A sync: %v", err)
+	}
+	if err := engB.Sync(context.Background()); err != nil {
+		t.Fatalf("B sync: %v", err)
+	}
+
+	if len(bl.data) != 1 {
+		t.Errorf("server holds %d blobs, want 1", len(bl.data))
+	}
+	if bl.uploads != 1 {
+		t.Errorf("%d uploads, want 1 (B should have skipped a present blob)", bl.uploads)
 	}
 }
 
