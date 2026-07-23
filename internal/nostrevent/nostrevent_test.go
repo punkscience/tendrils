@@ -71,12 +71,53 @@ func TestSignParseRoundTripTombstone(t *testing.T) {
 	}
 }
 
-func TestCreatedAtTracksMtime(t *testing.T) {
+// created_at is publication time, so a file with an old mtime still produces an
+// event the relay accepts as the newest for its path. Were created_at pinned to
+// mtime, restoring an old file (or re-creating a deleted one) would be silently
+// discarded by the relay as stale.
+func TestCreatedAtIsPublicationTimeNotMtime(t *testing.T) {
 	id := mustID(t)
-	mt := time.Unix(1_699_999_999, 0)
-	evt, _ := Sign(&tree.Entry{Path: "a.md", Sha256: "x", ModTime: mt}, id.SecretHex())
-	if evt.CreatedAt.Time().Unix() != mt.Unix() {
-		t.Errorf("created_at %d does not track mtime %d", evt.CreatedAt, mt.Unix())
+	mt := time.Unix(1_000_000_000, 0) // long in the past
+	before := time.Now().Unix()
+	evt, err := Sign(&tree.Entry{Path: "a.md", Sha256: "x", ModTime: mt}, id.SecretHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().Unix()
+
+	if got := evt.CreatedAt.Time().Unix(); got < before || got > after {
+		t.Errorf("created_at %d is not the publication time (want %d..%d)", got, before, after)
+	}
+	// The mtime must survive intact in its own tag — that is what LWW reads.
+	out, err := Parse(evt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.ModTime.Equal(mt) {
+		t.Errorf("mtime round-trip lost: got %v want %v", out.ModTime, mt)
+	}
+}
+
+// A tombstone stamped now, then the file re-created with its original older
+// mtime: the re-creation must still publish an event that supersedes the
+// tombstone at the relay. This is the case that was previously unpublishable.
+func TestRecreationAfterDeleteOutranksTombstone(t *testing.T) {
+	id := mustID(t)
+	tombstone, err := Sign(&tree.Entry{Path: "a.md", Deleted: true, ModTime: time.Now()}, id.SecretHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := Sign(&tree.Entry{
+		Path:    "a.md",
+		Sha256:  "x",
+		ModTime: time.Unix(1_000_000_000, 0), // restored file keeps its old mtime
+	}, id.SecretHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recreated.CreatedAt < tombstone.CreatedAt {
+		t.Errorf("re-creation created_at %d predates the tombstone's %d; the relay would discard it",
+			recreated.CreatedAt, tombstone.CreatedAt)
 	}
 }
 

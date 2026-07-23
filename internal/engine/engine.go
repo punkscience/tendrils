@@ -387,11 +387,28 @@ func (e *Engine) fetchRemote(ctx context.Context) (map[string]*tree.Entry, error
 			e.log.Warn("skipping unparseable event", "err", err)
 			continue
 		}
-		if prev, ok := out[entry.Path]; !ok || entry.ModTime.After(prev.ModTime) {
+		if prev, ok := out[entry.Path]; !ok || supersedes(entry, prev) {
 			out[entry.Path] = entry
 		}
 	}
 	return out, nil
+}
+
+// supersedes reports whether a should replace b as the remote truth for a path.
+// Newer mtime wins; an exact tie is broken by content hash, matching the rule
+// reconcile uses for local-vs-remote. Without that tie-break the winner would
+// depend on Go's map iteration order, so two devices folding the same set of
+// events could disagree about what "remote" is and publish over each other
+// indefinitely. A tombstone beats a live entry at the same instant — delete is
+// absolute, and its hash is empty, which would otherwise lose the comparison.
+func supersedes(a, b *tree.Entry) bool {
+	if !a.ModTime.Equal(b.ModTime) {
+		return a.ModTime.After(b.ModTime)
+	}
+	if a.Deleted != b.Deleted {
+		return a.Deleted
+	}
+	return a.Sha256 > b.Sha256
 }
 
 // preserveConflictCopy copies the current local file to a conflict-marked

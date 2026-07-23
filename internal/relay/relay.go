@@ -63,17 +63,32 @@ func (c *Client) Publish(ctx context.Context, evt *nostr.Event) error {
 	return fmt.Errorf("relay: publish rejected by all relays: %w", errors.Join(errs...))
 }
 
+// pageSize is how many events one paginated REQ asks for. Relays impose their
+// own maximum (the reference relay behind this deployment caps at 400) and will
+// return fewer, which pagination handles — asking for more than a relay allows
+// costs nothing, asking for fewer only costs round trips.
+const pageSize = 500
+
+// maxPages bounds pagination so a misbehaving relay — one ignoring `until`, say —
+// cannot spin forever. Hitting it means the result is incomplete, which Fetch
+// reports rather than passing off a partial set as the whole truth.
+const maxPages = 1000
+
 // Fetch returns every file-entry event the owner's key has published, unioned
 // across reachable relays and deduped by event ID. It errors only when no relay
 // could be reached; a partial answer from the relays that responded is returned
 // as-is (the engine folds duplicates by mtime regardless).
+//
+// Each relay is walked with NIP-01 pagination rather than a single query, because
+// a relay caps how many events one REQ may return. Without paging, a tree larger
+// than that cap yields a *silently truncated* view in which most paths look like
+// they were never published — and the engine, seeing no remote entry, republishes
+// the entire tree on every pass and can resurrect deleted files whose tombstones
+// fell outside the window. The remote set must be complete or the reconciler is
+// deciding against a fiction.
 func (c *Client) Fetch(ctx context.Context, pubkey string) ([]*nostr.Event, error) {
 	if len(c.urls) == 0 {
 		return nil, errors.New("relay: no relays configured")
-	}
-	filter := nostr.Filter{
-		Kinds:   []int{nostrevent.KindFileEntry},
-		Authors: []string{pubkey},
 	}
 
 	seen := make(map[string]struct{})
@@ -81,30 +96,73 @@ func (c *Client) Fetch(ctx context.Context, pubkey string) ([]*nostr.Event, erro
 	var errs []error
 	reached := false
 	for _, url := range c.urls {
-		r, err := c.relay(ctx, url)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", url, err))
-			continue
-		}
-		evts, err := r.QuerySync(ctx, filter)
-		if err != nil {
+		if err := c.fetchAll(ctx, url, pubkey, seen, &out); err != nil {
 			c.drop(url)
 			errs = append(errs, fmt.Errorf("%s: %w", url, err))
 			continue
 		}
 		reached = true
-		for _, e := range evts {
-			if _, dup := seen[e.ID]; dup {
-				continue
-			}
-			seen[e.ID] = struct{}{}
-			out = append(out, e)
-		}
 	}
 	if !reached {
 		return nil, fmt.Errorf("relay: no relay reachable: %w", errors.Join(errs...))
 	}
 	return out, nil
+}
+
+// fetchAll pages through one relay's copy of the owner's file-entry events,
+// appending newly-seen ones to out.
+//
+// The cursor is `until`, which NIP-01 defines inclusively (created_at <= until),
+// so each page re-reads the boundary timestamp; duplicates are absorbed by the
+// seen set. Termination is guaranteed by forcing the cursor strictly downward
+// whenever a page fails to advance it — the case where a full page shares one
+// created_at, which would otherwise re-request the same events forever.
+func (c *Client) fetchAll(ctx context.Context, url, pubkey string, seen map[string]struct{}, out *[]*nostr.Event) error {
+	r, err := c.relay(ctx, url)
+	if err != nil {
+		return err
+	}
+
+	var until *nostr.Timestamp
+	for page := 1; ; page++ {
+		if page > maxPages {
+			return fmt.Errorf("pagination did not terminate after %d pages; result would be incomplete", maxPages)
+		}
+		filter := nostr.Filter{
+			Kinds:   []int{nostrevent.KindFileEntry},
+			Authors: []string{pubkey},
+			Limit:   pageSize,
+			Until:   until,
+		}
+		evts, err := r.QuerySync(ctx, filter)
+		if err != nil {
+			return err
+		}
+		if len(evts) == 0 {
+			return nil // walked past the oldest event
+		}
+
+		oldest := evts[0].CreatedAt
+		for _, e := range evts {
+			if e.CreatedAt < oldest {
+				oldest = e.CreatedAt
+			}
+			if _, dup := seen[e.ID]; dup {
+				continue
+			}
+			seen[e.ID] = struct{}{}
+			*out = append(*out, e)
+		}
+
+		next := oldest
+		if until != nil && next >= *until {
+			next = *until - 1 // force progress; the page did not move the cursor
+		}
+		if next < 0 {
+			return nil // exhausted the timestamp range
+		}
+		until = &next
+	}
 }
 
 // FetchServerList returns the Blossom servers the owner's key advertises via its

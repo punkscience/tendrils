@@ -3,8 +3,10 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,10 +27,14 @@ import (
 type testRelay struct {
 	mu     sync.Mutex
 	events map[string]*nostr.Event // key: kind:pubkey:dtag
+	// maxLimit caps how many events one REQ can return, mirroring the real
+	// relay's UseEventstore(db, 400). A client that does not paginate silently
+	// sees only this many, which is the bug this cap exists to catch.
+	maxLimit int
 }
 
 func newTestRelay(t *testing.T) (url string, r *testRelay) {
-	r = &testRelay{events: map[string]*nostr.Event{}}
+	r = &testRelay{events: map[string]*nostr.Event{}, maxLimit: 400}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		conn, err := websocket.Accept(w, req, nil)
 		if err != nil {
@@ -90,6 +96,9 @@ func (tr *testRelay) save(evt *nostr.Event) {
 	}
 }
 
+// match applies the parts of NIP-01 the client's pagination depends on: kind and
+// author filtering, the `until` cursor, newest-first ordering, and a limit capped
+// by the relay's own maximum.
 func (tr *testRelay) match(f nostr.Filter) []*nostr.Event {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -101,7 +110,26 @@ func (tr *testRelay) match(f nostr.Filter) []*nostr.Event {
 		if len(f.Authors) > 0 && !contains(f.Authors, e.PubKey) {
 			continue
 		}
+		if f.Until != nil && e.CreatedAt > *f.Until {
+			continue
+		}
 		out = append(out, e)
+	}
+	// Newest first, as NIP-01 requires when a limit is applied. Ties broken by ID
+	// so the order is stable across calls (Go map iteration is not).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt > out[j].CreatedAt
+		}
+		return out[i].ID < out[j].ID
+	})
+
+	limit := tr.maxLimit
+	if f.Limit > 0 && f.Limit < limit {
+		limit = f.Limit
+	}
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -140,6 +168,22 @@ func signEntry(t *testing.T, id *keys.Identity, e *tree.Entry) *nostr.Event {
 	t.Helper()
 	evt, err := nostrevent.Sign(e, id.SecretHex())
 	if err != nil {
+		t.Fatal(err)
+	}
+	return evt
+}
+
+// signEntryAt signs with an explicit created_at. Pagination walks the created_at
+// axis, so those tests need to place events on it deliberately — and the stamp
+// must be set before signing or go-nostr rejects the event as unsigned.
+func signEntryAt(t *testing.T, id *keys.Identity, e *tree.Entry, createdAt int64) *nostr.Event {
+	t.Helper()
+	evt, err := nostrevent.Build(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evt.CreatedAt = nostr.Timestamp(createdAt)
+	if err := evt.Sign(id.SecretHex()); err != nil {
 		t.Fatal(err)
 	}
 	return evt
@@ -195,6 +239,64 @@ func TestReplacePreservesLatest(t *testing.T) {
 	entry, _ := nostrevent.Parse(got[0])
 	if entry.Sha256 != "new" {
 		t.Errorf("kept %q, want the newest %q", entry.Sha256, "new")
+	}
+}
+
+// A tree larger than the relay's per-REQ cap must still fetch in full. Without
+// pagination the client sees only the newest maxLimit events, every other path
+// looks unpublished, and the engine republishes the whole tree every pass.
+func TestFetchPaginatesPastRelayLimit(t *testing.T) {
+	url, r := newTestRelay(t)
+	id := mustID(t)
+	const total = 950 // comfortably more than two pages of the 400-event cap
+
+	for i := 0; i < total; i++ {
+		// Spread created_at so the `until` cursor has room to walk backwards.
+		r.save(signEntryAt(t, id, &tree.Entry{
+			Path:    fmt.Sprintf("f%04d.md", i),
+			Sha256:  fmt.Sprintf("h%04d", i),
+			ModTime: time.Unix(1_700_000_000, 0),
+		}, 1_700_000_000+int64(i)))
+	}
+
+	c := New([]string{url})
+	defer c.Close()
+	got, err := c.Fetch(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("fetched %d events, want all %d (relay caps one REQ at %d)", len(got), total, r.maxLimit)
+	}
+}
+
+// Pagination must terminate even when every event shares one created_at, which
+// leaves the `until` cursor with nowhere to advance on its own.
+func TestFetchTerminatesOnIdenticalTimestamps(t *testing.T) {
+	url, r := newTestRelay(t)
+	id := mustID(t)
+	const total = 600 // more than one page, all at the same instant
+
+	for i := 0; i < total; i++ {
+		r.save(signEntryAt(t, id, &tree.Entry{
+			Path:    fmt.Sprintf("f%04d.md", i),
+			Sha256:  fmt.Sprintf("h%04d", i),
+			ModTime: time.Unix(1_700_000_000, 0),
+		}, 1_700_000_000))
+	}
+
+	c := New([]string{url})
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := c.Fetch(ctx, id.PublicHex())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	// The relay can only ever surface maxLimit of a single-timestamp pile, so the
+	// point here is that Fetch returns rather than spinning.
+	if len(got) == 0 {
+		t.Fatal("fetched nothing")
 	}
 }
 

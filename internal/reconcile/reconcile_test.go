@@ -30,6 +30,30 @@ func want(t *testing.T, got Decision, op Op, conflict bool) {
 	}
 }
 
+// "A delete is absolute." This device deleted the file and recorded the
+// tombstone; a concurrent edit on another device then displaced that tombstone
+// on the relay (one event survives per path). The edit predates our delete, so
+// re-assert the tombstone instead of pulling the file back.
+func TestConcurrentEditDoesNotResurrectDeletedFile(t *testing.T) {
+	base := tomb("notes/gone.md", t2)             // we deleted it at t2
+	remote := file("notes/gone.md", "edited", t1) // someone edited at t1, published later
+	want(t, Decide(base, nil, remote), OpPublishDelete, false)
+}
+
+// The counterpart: a remote entry *newer* than our tombstone is a deliberate
+// re-creation on another device, which is honoured rather than re-deleted.
+func TestRecreationAfterOurDeleteIsPulled(t *testing.T) {
+	base := tomb("notes/gone.md", t1)                // we deleted it at t1
+	remote := file("notes/gone.md", "recreated", t2) // re-created afterwards at t2
+	want(t, Decide(base, nil, remote), OpWriteRemote, false)
+}
+
+// A never-synced device (no base at all) must still pull, not mistake an absent
+// base for an applied delete.
+func TestNoBaseStillPulls(t *testing.T) {
+	want(t, Decide(nil, nil, file("notes/new.md", "aaa", t1)), OpWriteRemote, false)
+}
+
 // local-first-sync: "A new file appears on the other device" — from the
 // receiving device's view, a file it lacks is pulled.
 func TestNewRemoteFileIsPulled(t *testing.T) {

@@ -13,16 +13,26 @@
 //	size tag:   plaintext byte length; absent on a tombstone
 //	mtime tag:  file modification time as unix seconds (drives last-writer-wins)
 //	deleted tag: present iff this is a tombstone
-//	created_at: set to the file mtime, so the relay's own "keep the newest
-//	            replaceable event per (pubkey, kind, d)" rule aligns with mtime LWW.
+//	created_at: the moment the event is published — NOT the file mtime.
 //	content:    empty — an entry is metadata; the bytes live on Blossom.
 //
-// Known limitation (resolved at the engine layer, not here): because the relay
-// keeps only the newest event per path, a delete published with an older mtime
-// than a concurrent edit will be dropped by the relay in favour of the edit,
-// even though "a delete is absolute". A device that recorded the tombstone in
-// its index keeps enforcing and re-asserting it; the engine is responsible for
-// that re-assertion. This codec only serializes; it does not arbitrate.
+// Why created_at is publication time, not mtime: a relay keeps the newest event
+// per (pubkey, kind, d) by created_at, so created_at decides which *publish*
+// survives, while the mtime tag decides which *version of the file* wins. Those
+// are different questions and conflating them broke three cases:
+//
+//   - Re-creating a deleted file was unpublishable. A tombstone is stamped at
+//     delete time (now), so a file restored afterwards — carrying its original,
+//     older mtime — produced an event the relay silently discarded as stale. The
+//     reconciler's "re-creation is honoured" rule could never reach other devices.
+//   - Restoring any older version was likewise a no-op on the relay.
+//   - A device whose event was dropped never learns of it, so it republishes the
+//     same losing event on every pass, forever.
+//
+// With created_at = now, the latest publish always lands, and arbitration between
+// versions happens where it belongs: in internal/reconcile, over the mtime tag.
+// Parse has always preferred the mtime tag over created_at, so events written by
+// earlier builds still decode identically — only the relay's tie-breaking changes.
 package nostrevent
 
 import (
@@ -61,7 +71,7 @@ func Build(e *tree.Entry) (*nostr.Event, error) {
 		}
 	}
 	return &nostr.Event{
-		CreatedAt: nostr.Timestamp(e.ModTime.Unix()),
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Kind:      KindFileEntry,
 		Tags:      tags,
 		Content:   "",

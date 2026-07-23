@@ -89,6 +89,16 @@ func decideRemoteLive(base, local, remote *tree.Entry) Decision {
 		if base.Live() {
 			return Decision{Op: OpPublishDelete, Reason: "file deleted locally, publish tombstone"}
 		}
+		// A tombstone in the base means this device already applied a delete for
+		// this path. A live remote entry that is no newer than that tombstone is a
+		// concurrent edit which raced the delete — the relay keeps one event per
+		// path, so the edit displaced our tombstone. Delete is absolute, so
+		// re-assert it rather than pulling back a file the owner deleted.
+		if base.Tomb() && !remote.ModTime.After(base.ModTime) {
+			return Decision{Op: OpPublishDelete, Reason: "delete is absolute, re-assert tombstone over older edit"}
+		}
+		// Otherwise the remote entry postdates our tombstone: a deliberate
+		// re-creation on another device, which is honoured.
 		return Decision{Op: OpWriteRemote, Reason: "missing locally, pull from set"}
 	}
 
