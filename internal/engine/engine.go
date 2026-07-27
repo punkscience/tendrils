@@ -53,7 +53,9 @@ type EventStore interface {
 type BlobStore interface {
 	Upload(ctx context.Context, data []byte) (blob.Descriptor, error)
 	Download(ctx context.Context, sha256 string) ([]byte, error)
-	Has(ctx context.Context, sha256 string) (bool, error)
+	// Has reports whether the store already holds this blob at this exact size.
+	// The size is what makes a skipped upload safe — see blob.Client.Has.
+	Has(ctx context.Context, sha256 string, size int64) (bool, error)
 }
 
 // Progress is the engine's position within a Sync pass, emitted to the callback
@@ -76,7 +78,7 @@ type Engine struct {
 	events      EventStore
 	log         *slog.Logger
 	report      func(Progress)
-	statsReport func(pending, conflicts int)
+	statsReport func(Stats)
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -91,15 +93,22 @@ func (e *Engine) reportProgress(p Progress) {
 	}
 }
 
-// OnStats registers a callback given, once per pass, the number of pending local
-// changes (files to upload or tombstone) and conflict copies awaiting the owner.
-// The engine has both in hand from the pass's scan and plan, so a status query
-// can report them without an expensive rescan of its own. Optional; nil disables.
-func (e *Engine) OnStats(fn func(pending, conflicts int)) { e.statsReport = fn }
+// Stats is a pass's outstanding-work summary.
+type Stats struct {
+	Pending   int // local changes still to push (uploads and tombstones)
+	Conflicts int // conflict copies sitting in the tree, awaiting the owner
+	Deferred  int // paths held back by retry backoff after repeated failures
+}
 
-func (e *Engine) reportStats(pending, conflicts int) {
+// OnStats registers a callback given, once per pass, that pass's outstanding
+// work. The engine has all of it in hand from the scan and plan, so a status
+// query can report it without an expensive rescan of its own. Optional; nil
+// disables reporting.
+func (e *Engine) OnStats(fn func(Stats)) { e.statsReport = fn }
+
+func (e *Engine) reportStats(s Stats) {
 	if e.statsReport != nil {
-		e.statsReport(pending, conflicts)
+		e.statsReport(s)
 	}
 }
 
@@ -110,6 +119,9 @@ type plannedAction struct {
 	decision reconcile.Decision
 	local    *tree.Entry
 	remote   *tree.Entry
+	// deferred marks a path still inside its retry backoff: planned, counted as
+	// outstanding work, but not acted on this pass.
+	deferred bool
 }
 
 // New builds an Engine. It derives the blob-encryption key from id up front so
@@ -151,12 +163,17 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: fetch remote: %w", err)
 	}
+	retries, err := e.idx.Retries()
+	if err != nil {
+		return fmt.Errorf("engine: read retry state: %w", err)
+	}
 	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
 	// fresh each pass so edits take effect without a restart.
 	ign := e.loadIgnore()
 
 	// Plan first, so the total is known before any action runs — that count is
 	// what turns per-file progress into "3 of 12".
+	now := time.Now()
 	var plan []plannedAction
 	for _, path := range unionPaths(local, base, remote) {
 		if err := ctx.Err(); err != nil {
@@ -171,27 +188,49 @@ func (e *Engine) Sync(ctx context.Context) error {
 		if d.Op == reconcile.OpNone {
 			continue
 		}
-		plan = append(plan, plannedAction{path: path, decision: d, local: local[path], remote: remote[path]})
+		plan = append(plan, plannedAction{
+			path:     path,
+			decision: d,
+			local:    local[path],
+			remote:   remote[path],
+			deferred: retries[path].NextAttempt.After(now),
+		})
 	}
 
 	// Publish the pass's outstanding-work counts for the status endpoint, so a
 	// query reports these from the pass the daemon already ran rather than paying
-	// for its own full-tree rescan. Pending = local changes to push; conflicts =
-	// conflict copies sitting in the tree.
+	// for its own full-tree rescan. Deferred paths are counted as pending too:
+	// work held back by backoff is still outstanding, and hiding it would report
+	// a tree as synced when it is not.
 	e.reportStats(passStats(local, plan))
 
-	total := len(plan)
+	// Acting only on what is not in backoff keeps a permanently-failing file from
+	// consuming a slot and two log lines every pass, and keeps the progress total
+	// honest about what this pass will actually attempt.
+	todo := make([]plannedAction, 0, len(plan))
+	for _, a := range plan {
+		if !a.deferred {
+			todo = append(todo, a)
+		}
+	}
+	if n := len(plan) - len(todo); n > 0 {
+		e.log.Info("paths held back by retry backoff", "count", n)
+	}
+
+	total := len(todo)
 	var errs []error
-	for i, a := range plan {
+	for i, a := range todo {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		e.reportProgress(Progress{Done: i, Total: total, Path: a.path, Op: verb(a.decision.Op)})
 		e.log.Info("reconcile", "path", a.path, "op", a.decision.Op.String(), "reason", a.decision.Reason)
-		if err := e.execute(ctx, a.path, a.decision, a.local, a.remote); err != nil {
+		err := e.execute(ctx, a.path, a.decision, a.local, a.remote)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.path, err))
 			e.log.Error("action failed", "path", a.path, "op", a.decision.Op.String(), "err", err)
 		}
+		e.recordAttempt(a.path, retries[a.path], err, time.Now())
 	}
 	e.reportProgress(Progress{Done: total, Total: total}) // pass finished, idle
 
@@ -203,22 +242,51 @@ func (e *Engine) Sync(ctx context.Context) error {
 
 // passStats derives the status counts from a pass's scan and plan: pending is the
 // number of local changes to push (uploads and tombstones, conflict copies
-// aside), conflicts the number of conflict copies present in the tree.
-func passStats(local map[string]*tree.Entry, plan []plannedAction) (pending, conflicts int) {
+// aside), conflicts the number of conflict copies present in the tree, deferred
+// the number of paths backoff held back this pass.
+func passStats(local map[string]*tree.Entry, plan []plannedAction) Stats {
+	var s Stats
 	for path := range local {
 		if scan.IsConflictCopy(path) {
-			conflicts++
+			s.Conflicts++
 		}
 	}
 	for _, a := range plan {
+		if a.deferred {
+			s.Deferred++
+		}
 		if scan.IsConflictCopy(a.path) {
 			continue
 		}
 		if a.decision.Op == reconcile.OpPublishLocal || a.decision.Op == reconcile.OpPublishDelete {
-			pending++
+			s.Pending++
 		}
 	}
-	return pending, conflicts
+	return s
+}
+
+// recordAttempt updates a path's backoff state from the outcome of its action:
+// cleared on success, advanced to the next interval on failure. Both are
+// best-effort — a lost write only means the next pass judges the path afresh,
+// which is the behaviour that existed before backoff did.
+func (e *Engine) recordAttempt(path string, prev index.Retry, cause error, now time.Time) {
+	if cause == nil {
+		// Failures is >=1 in any stored record, so this also asks "was there one?"
+		// and spares the common success path a write.
+		if prev.Failures > 0 {
+			if err := e.idx.ClearRetry(path); err != nil {
+				e.log.Warn("could not clear retry state", "path", path, "err", err)
+			}
+		}
+		return
+	}
+	r := nextRetry(prev, cause, now)
+	if err := e.idx.SetRetry(path, r); err != nil {
+		e.log.Warn("could not record retry state", "path", path, "err", err)
+		return
+	}
+	e.log.Info("path held back after failure",
+		"path", path, "failures", r.Failures, "permanent", r.Permanent, "next_attempt", r.NextAttempt)
 }
 
 // verb is the human-facing present participle for an action, shown in progress.
@@ -271,10 +339,19 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 	}
 
 	// Re-hash from the bytes we just read so the published identity matches what
-	// we uploaded, not a possibly-stale scan result.
+	// we uploaded, not a possibly-stale scan result. The scan hashed the file
+	// earlier in the pass; anything that rewrote it in between (a tag editor, a
+	// still-running copy) would otherwise be published as "these bytes, under the
+	// old hash" — an event no device can ever satisfy, because the blob it points
+	// at decrypts to content that does not match the hash beside it.
+	//
+	// ModTime deliberately stays the scan's, older than the file's if it did
+	// change: that mismatch is what makes the next scan re-hash the path and
+	// publish a corrected entry. Taking a fresh mtime here would instead match the
+	// file, and the drift would never be noticed again.
 	entry := &tree.Entry{
 		Path:     local.Path,
-		Sha256:   local.Sha256,
+		Sha256:   hashHex(plaintext),
 		BlobHash: blobHash,
 		Size:     int64(len(plaintext)),
 		ModTime:  local.ModTime,
@@ -293,9 +370,14 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 //
 // A failed existence check is not fatal: it only costs us the optimisation, and
 // re-uploading identical bytes to the same address is harmless.
+//
+// The size is passed so the check cannot be satisfied by a blob that is present
+// but wrong. Skipping an upload is only safe if the server holds *these* bytes;
+// trusting bare existence let a truncated blob permanently strand a file while
+// every pass reported success.
 func (e *Engine) uploadIfAbsent(ctx context.Context, sealed []byte) (string, error) {
 	want := hashHex(sealed)
-	switch present, err := e.blobs.Has(ctx, want); {
+	switch present, err := e.blobs.Has(ctx, want, int64(len(sealed))); {
 	case err != nil:
 		e.log.Debug("blob presence check failed, uploading anyway", "blob", short(want), "err", err)
 	case present:
@@ -380,18 +462,37 @@ func (e *Engine) fetchRemote(ctx context.Context) (map[string]*tree.Entry, error
 	if err != nil {
 		return nil, err
 	}
+	out, skipped := FoldRemote(evts)
+	for _, err := range skipped {
+		e.log.Warn("skipping unparseable event", "err", err)
+	}
+	return out, nil
+}
+
+// FoldRemote folds raw file-entry events into the current per-path truth, and
+// returns the parse errors it skipped over.
+//
+// Exported because anything that needs to know "what does the relay currently say
+// is true?" must fold by exactly this rule. Blob collection is the case that
+// forced it: a sweeper deciding which blobs are live has to agree with the engine
+// about which event wins per path, or it will either spare garbage forever or
+// delete a blob a device is about to pull. Relays may retain superseded
+// replaceable events, so the raw event list holds several versions of a path and
+// folding is not optional.
+func FoldRemote(evts []*nostr.Event) (map[string]*tree.Entry, []error) {
 	out := make(map[string]*tree.Entry, len(evts))
+	var skipped []error
 	for _, evt := range evts {
 		entry, err := nostrevent.Parse(evt)
 		if err != nil {
-			e.log.Warn("skipping unparseable event", "err", err)
+			skipped = append(skipped, err)
 			continue
 		}
 		if prev, ok := out[entry.Path]; !ok || supersedes(entry, prev) {
 			out[entry.Path] = entry
 		}
 	}
-	return out, nil
+	return out, skipped
 }
 
 // supersedes reports whether a should replace b as the remote truth for a path.

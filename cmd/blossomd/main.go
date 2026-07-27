@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,10 @@ import (
 
 // authKind is the BUD-01 authorization event kind the Tendrils blob client signs.
 const authKind = 24242
+
+// emptySHA256 is the content address of zero bytes — the only address a 0-byte
+// blob may legitimately be filed under.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func main() {
 	dir := envOr("BLOSSOM_DIR", "./blobs")
@@ -74,7 +79,7 @@ func main() {
 			}
 			sum := sha256.Sum256(data)
 			h := hex.EncodeToString(sum[:])
-			if err := os.WriteFile(filepath.Join(dir, h), data, 0o644); err != nil {
+			if err := storeAtomic(dir, h, data); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -87,6 +92,36 @@ func main() {
 			})
 
 		case http.MethodGet, http.MethodHead:
+			// BUD-02 listing. Enumerating the store is what makes orphan collection
+			// possible: a sweeper cannot tell which blobs are unreferenced without
+			// first knowing which blobs exist.
+			if strings.HasPrefix(r.URL.Path, "/list") {
+				if err := authorize(r, allowed, "list"); err != nil {
+					http.Error(w, err.Error(), http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodHead {
+					return
+				}
+				// Streamed, not built then sent. Reporting a blob's size costs a stat
+				// each, and a store with tens of thousands of blobs on a slow disk
+				// takes many minutes to walk — long enough that a client waiting for
+				// response headers gives up before the first byte. Writing the array
+				// as it is walked puts the headers out immediately and lets the body
+				// take as long as it needs.
+				n, err := streamList(w, dir)
+				if err != nil {
+					// Too late for a status code; the client's JSON decode will fail,
+					// which is the correct outcome — a truncated listing must never be
+					// mistaken for a complete one.
+					log.Printf("GET %s failed after %d blobs: %v", r.URL.Path, n, err)
+					return
+				}
+				log.Printf("GET %s -> %d blobs", r.URL.Path, n)
+				return
+			}
+
 			if err := authorize(r, allowed, "get"); err != nil {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
@@ -99,6 +134,16 @@ func main() {
 			p := filepath.Join(dir, h)
 			info, err := os.Stat(p)
 			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			// A blob that cannot possibly hash to the address it is filed under is
+			// corrupt, and reporting it as present is worse than reporting it absent:
+			// clients skip re-uploading what the server claims to hold. Only the
+			// empty-file case is detectable without rehashing, and it is the one
+			// earlier non-atomic writes actually produced.
+			if info.Size() == 0 && h != emptySHA256 {
+				log.Printf("corrupt blob %s (0 bytes) reported as absent", h)
 				http.NotFound(w, r)
 				return
 			}
@@ -148,6 +193,185 @@ func main() {
 		log.Printf("blossomd listening on %s, dir=%s (auth on, %d allowed key(s))", addr, dir, len(allowed))
 	}
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+// blobInfo is one stored blob as reported by the listing.
+type blobInfo struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	// inode orders the listing by approximate physical layout; never serialised.
+	inode uint64 `json:"-"`
+	// Uploaded is the store's own mtime, not a client-supplied time. A sweeper
+	// needs it to leave recently-written blobs alone: an upload whose describing
+	// event has not propagated yet must not look like an orphan.
+	Uploaded int64 `json:"uploaded"`
+}
+
+// forEachBlob walks the store, calling fn for every well-formed blob. Only
+// 64-hex names qualify, so an in-progress temp file from storeAtomic is never
+// mistaken for a blob — a sweeper that treated one as an orphan would delete a
+// blob mid-write.
+//
+// Listing order is not cosmetic, it is the difference between a sweep that takes
+// hours and one that takes days. Callers read each blob's contents in the order
+// we report, and blob stores sit on spinning disks. Two traps:
+//
+//   - `os.ReadDir` sorts by filename, and here the filename *is* the content
+//     hash — so it hands back an order guaranteed to be random with respect to
+//     physical layout. `File.ReadDir` does not sort, which is why it is used here.
+//   - ext4's own directory order is by filename *hash* too, so raw readdir order
+//     is no better. Sorting by inode is what actually helps: ext4 allocates a
+//     file's data near its inode, so ascending inode order approximates ascending
+//     disk order.
+//
+// A real sweep of 73k blobs on a USB disk ran at 5 MB/s in hash order.
+func forEachBlob(dir string, fn func(blobInfo) error) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// ReadDir on the *File (not os.ReadDir) returns entries unsorted.
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+
+	blobs := make([]blobInfo, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !isBlobName(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // vanished mid-listing; it is simply not there
+		}
+		blobs = append(blobs, blobInfo{
+			SHA256:   e.Name(),
+			Size:     info.Size(),
+			Uploaded: info.ModTime().Unix(),
+			inode:    inodeOf(info),
+		})
+	}
+	sort.Slice(blobs, func(i, j int) bool { return blobs[i].inode < blobs[j].inode })
+
+	for _, b := range blobs {
+		if err := fn(b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// listBlobs enumerates the store into a slice. Used where the whole list is
+// wanted at once; the HTTP handler streams instead.
+func listBlobs(dir string) ([]blobInfo, error) {
+	var out []blobInfo
+	err := forEachBlob(dir, func(b blobInfo) error {
+		out = append(out, b)
+		return nil
+	})
+	return out, err
+}
+
+// streamList writes the listing as a JSON array while it walks, flushing so the
+// client sees headers and progress rather than waiting for the whole walk.
+func streamList(w http.ResponseWriter, dir string) (int, error) {
+	flusher, _ := w.(http.Flusher)
+	if _, err := io.WriteString(w, "["); err != nil {
+		return 0, err
+	}
+	if flusher != nil {
+		flusher.Flush() // headers out now, before the expensive part
+	}
+
+	n := 0
+	enc := json.NewEncoder(w)
+	err := forEachBlob(dir, func(b blobInfo) error {
+		if n > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if err := enc.Encode(b); err != nil {
+			return err
+		}
+		n++
+		if flusher != nil && n%1000 == 0 {
+			flusher.Flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return n, err
+	}
+	if _, err := io.WriteString(w, "]"); err != nil {
+		return n, err
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return n, nil
+}
+
+// isBlobName reports whether name is a 64-character lowercase hex content address.
+func isBlobName(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// storeAtomic writes data to its content address so that the blob is either
+// absent or complete, never half-written.
+//
+// The obvious `os.WriteFile(dir/h, data)` is not safe here, and shipping it cost
+// a week of silent corruption. WriteFile opens with O_CREATE|O_TRUNC and *then*
+// writes: when the write fails — a full disk is the easy way — the create has
+// already succeeded, so an empty file is left sitting at the blob's final
+// address. From then on the server answers HEAD for that address with 200, every
+// client's "does it already have this?" check says yes and skips the upload, and
+// the blob is never repaired. A transient ENOSPC becomes a permanent, silent
+// failure for that file, and no log line anywhere says so.
+//
+// Writing to a temp file in the same directory and renaming only once the bytes
+// are down makes presence mean what every caller already assumes it means. The
+// rename is atomic within a filesystem, so a reader sees the old state or the new
+// one. On any failure the temp file is removed, leaving nothing behind to lie
+// about.
+func storeAtomic(dir, h string, data []byte) error {
+	if _, err := os.Stat(filepath.Join(dir, h)); err == nil {
+		return nil // already stored; content-addressed, so it is the same bytes
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-"+h+"-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(name) // no-op once the rename below has succeeded
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	// Durability before visibility: fsync, then rename. Without the sync a crash
+	// could leave the rename visible with the contents still in page cache.
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, filepath.Join(dir, h))
 }
 
 // authorize enforces the pubkey allowlist for one verb ("upload"/"get"/"delete"). When no

@@ -28,7 +28,10 @@ type statusSnapshot struct {
 	LastReconcile time.Time `json:"last_reconcile"`
 	Pending       int       `json:"pending"`
 	Conflicts     int       `json:"conflicts"`
-	Syncing       bool      `json:"syncing"`
+	// Deferred counts paths that keep failing and are waiting out a retry
+	// backoff. They are included in Pending — this says how much of it is stuck.
+	Deferred int  `json:"deferred"`
+	Syncing  bool `json:"syncing"`
 	// Per-file progress within the current pass (meaningful only while Syncing).
 	Done      int    `json:"done"`
 	Total     int    `json:"total"`
@@ -42,12 +45,11 @@ type statusSnapshot struct {
 // last pass, and the error from the last pass (empty on success). It is the
 // daemon's cache so a status query never pays for its own full-tree rescan.
 type syncState struct {
-	mu        sync.Mutex
-	syncing   bool
-	lastErr   string
-	progress  engine.Progress
-	pending   int
-	conflicts int
+	mu       sync.Mutex
+	syncing  bool
+	lastErr  string
+	progress engine.Progress
+	stats    engine.Stats
 }
 
 func (s *syncState) begin() {
@@ -79,16 +81,16 @@ func (s *syncState) setProgress(p engine.Progress) {
 // setStats is the engine's OnStats callback; the counts persist across passes
 // (begin/end never clear them) so an idle daemon still reports the last known
 // outstanding work.
-func (s *syncState) setStats(pending, conflicts int) {
+func (s *syncState) setStats(st engine.Stats) {
 	s.mu.Lock()
-	s.pending, s.conflicts = pending, conflicts
+	s.stats = st
 	s.mu.Unlock()
 }
 
-func (s *syncState) read() (syncing bool, lastErr string, p engine.Progress, pending, conflicts int) {
+func (s *syncState) read() (syncing bool, lastErr string, p engine.Progress, st engine.Stats) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.syncing, s.lastErr, s.progress, s.pending, s.conflicts
+	return s.syncing, s.lastErr, s.progress, s.stats
 }
 
 // statusServer answers the CLI's status query for a running daemon. Reads on the
@@ -110,7 +112,7 @@ func (srv *statusServer) handler(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	syncing, lastErr, prog, pending, conflicts := srv.state.read()
+	syncing, lastErr, prog, stats := srv.state.read()
 	npub, _ := srv.id.Npub()
 	snap := statusSnapshot{
 		Identity:      npub,
@@ -118,8 +120,9 @@ func (srv *statusServer) handler(w http.ResponseWriter, _ *http.Request) {
 		Relays:        srv.cfg.Relays,
 		Storage:       srv.cfg.BlossomServers,
 		LastReconcile: last,
-		Pending:       pending,
-		Conflicts:     conflicts,
+		Pending:       stats.Pending,
+		Conflicts:     stats.Conflicts,
+		Deferred:      stats.Deferred,
 		Syncing:       syncing,
 		Done:          prog.Done,
 		Total:         prog.Total,

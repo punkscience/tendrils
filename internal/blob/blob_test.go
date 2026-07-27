@@ -144,6 +144,51 @@ func TestUploadServerError(t *testing.T) {
 	}
 }
 
+// A size rejection is typed, so the engine can tell "retrying cannot fix this"
+// from a transient failure. In practice it comes from a proxy in front of the
+// server, not the server itself.
+func TestUploadTooLargeIsTyped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte("<html>\r\n<head><title>413 Payload Too Large</title></head>\r\n<body>\r\n" +
+			"<center><h1>413 Payload Too Large</h1></center>\r\n<hr><center>cloudflare</center>\r\n</body>\r\n</html>"))
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, testIdentity(t)).Upload(context.Background(), []byte("data"))
+	if err == nil {
+		t.Fatal("expected error on 413, got nil")
+	}
+	if !errors.Is(err, ErrTooLarge) {
+		t.Errorf("413 should wrap ErrTooLarge, got: %v", err)
+	}
+	// The whole point of typing it is that the message can then stay short: a
+	// quoted HTML error page per rejected file is what made the log unreadable.
+	if strings.Contains(err.Error(), "<html") {
+		t.Errorf("error quoted the proxy's HTML page: %v", err)
+	}
+	if len(err.Error()) > 200 {
+		t.Errorf("error is %d chars, too long to log per file: %v", len(err.Error()), err)
+	}
+	if !strings.Contains(err.Error(), "413") {
+		t.Errorf("error should still name the status, got: %v", err)
+	}
+}
+
+// A non-HTML error body is still surfaced — dropping the proxy's boilerplate must
+// not cost us a real server's explanation.
+func TestUploadErrorKeepsPlainBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "blob store is full", http.StatusInsufficientStorage)
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, testIdentity(t)).Upload(context.Background(), []byte("data"))
+	if err == nil || !strings.Contains(err.Error(), "blob store is full") {
+		t.Errorf("error should surface the server message, got: %v", err)
+	}
+}
+
 func TestDownloadRoundTrip(t *testing.T) {
 	data := []byte("the sealed blob bytes")
 	sum := hexHash(data)
@@ -200,6 +245,7 @@ func TestHas(t *testing.T) {
 		}
 		checkAuth(t, r, "get")
 		if r.URL.Path == "/"+present {
+			w.Header().Set("Content-Length", "4")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -208,11 +254,65 @@ func TestHas(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, testIdentity(t))
-	if ok, err := c.Has(context.Background(), present); err != nil || !ok {
+	if ok, err := c.Has(context.Background(), present, 4); err != nil || !ok {
 		t.Errorf("Has(present) = %v, %v; want true, nil", ok, err)
 	}
-	if ok, err := c.Has(context.Background(), strings.Repeat("c", 64)); err != nil || ok {
+	if ok, err := c.Has(context.Background(), strings.Repeat("c", 64), 4); err != nil || ok {
 		t.Errorf("Has(absent) = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// A blob that is present but the wrong length must report absent. This is the
+// check that stops a truncated blob — an earlier blossomd left empty ones behind
+// when its disk filled — from being mistaken for a completed upload and never
+// repaired. Reporting absent costs a redundant upload; reporting present
+// abandons the file silently.
+func TestHasRejectsWrongSize(t *testing.T) {
+	h := strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name        string
+		contentLen  string
+		wantPresent bool
+	}{
+		{"exact size", "100", true},
+		{"truncated to empty", "0", false},
+		{"short", "42", false},
+		{"longer than expected", "101", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				checkAuth(t, r, "get")
+				w.Header().Set("Content-Length", tc.contentLen)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			ok, err := New(srv.URL, testIdentity(t)).Has(context.Background(), h, 100)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ok != tc.wantPresent {
+				t.Errorf("Has(size=100) with Content-Length %s = %v, want %v", tc.contentLen, ok, tc.wantPresent)
+			}
+		})
+	}
+}
+
+// A server that does not report a length at all is treated as not holding the
+// blob: we cannot confirm the bytes, so we re-upload rather than assume.
+func TestHasWithoutContentLengthIsAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checkAuth(t, r, "get")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ok, err := New(srv.URL, testIdentity(t)).Has(context.Background(), strings.Repeat("b", 64), 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("a HEAD with no Content-Length should report absent")
 	}
 }
 

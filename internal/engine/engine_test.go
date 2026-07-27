@@ -60,9 +60,9 @@ func (f *fakeBlobs) Upload(_ context.Context, data []byte) (blob.Descriptor, err
 	return blob.Descriptor{SHA256: sum, Size: int64(len(data)), URL: "mem://" + sum}, nil
 }
 
-func (f *fakeBlobs) Has(_ context.Context, sha256 string) (bool, error) {
-	_, ok := f.data[sha256]
-	return ok, nil
+func (f *fakeBlobs) Has(_ context.Context, sha256 string, size int64) (bool, error) {
+	b, ok := f.data[sha256]
+	return ok && int64(len(b)) == size, nil
 }
 
 func (f *fakeBlobs) Download(_ context.Context, sha256 string) ([]byte, error) {
@@ -223,9 +223,9 @@ func TestStatsReporting(t *testing.T) {
 	writeFile(t, root, "c"+scan.ConflictMarker+"deadbeef.md", "conflict", time.Unix(1_700_000_000, 0))
 
 	eng := newEngine(t, root, id, ev, bl)
-	var pending, conflicts int
+	var stats Stats
 	var calls int
-	eng.OnStats(func(p, c int) { pending, conflicts, calls = p, c, calls+1 })
+	eng.OnStats(func(s Stats) { stats, calls = s, calls+1 })
 
 	if err := eng.Sync(context.Background()); err != nil {
 		t.Fatalf("sync: %v", err)
@@ -233,11 +233,14 @@ func TestStatsReporting(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("OnStats called %d times, want 1 per pass", calls)
 	}
-	if pending != 2 {
-		t.Errorf("pending = %d, want 2 (a.md, b.md)", pending)
+	if stats.Pending != 2 {
+		t.Errorf("pending = %d, want 2 (a.md, b.md)", stats.Pending)
 	}
-	if conflicts != 1 {
-		t.Errorf("conflicts = %d, want 1", conflicts)
+	if stats.Conflicts != 1 {
+		t.Errorf("conflicts = %d, want 1", stats.Conflicts)
+	}
+	if stats.Deferred != 0 {
+		t.Errorf("deferred = %d, want 0 (nothing has failed)", stats.Deferred)
 	}
 }
 
@@ -359,6 +362,55 @@ func TestTwoDeviceConvergence(t *testing.T) {
 	got, ok := readFile(t, rootB, "shared/note.md")
 	if !ok || got != "written on A" {
 		t.Errorf("B has %q (present=%v), want %q", got, ok, "written on A")
+	}
+}
+
+// A file rewritten between the scan that hashed it and the publish that reads it
+// must be published under the hash of the bytes actually uploaded, not the scan's
+// stale one. Publishing the stale hash produces an event no device can ever
+// satisfy: the blob it points at decrypts to content that does not match the hash
+// beside it, so every puller rejects it on the integrity check, forever.
+func TestPublishUsesHashOfUploadedBytes(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+
+	rootA := t.TempDir()
+	writeFile(t, rootA, "track.mp3", "retagged bytes", time.Unix(1_700_000_200, 0))
+	engA := newEngine(t, rootA, id, ev, bl)
+
+	// The entry a scan would have produced had it read the file before a tag
+	// editor rewrote it: right path and mtime, hash of content that is now gone.
+	stale := &tree.Entry{
+		Path:    "track.mp3",
+		Sha256:  hashHex([]byte("bytes as first scanned")),
+		Size:    int64(len("bytes as first scanned")),
+		ModTime: time.Unix(1_700_000_200, 0),
+	}
+	if err := engA.publishLocal(context.Background(), stale); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// The published identity describes what was uploaded.
+	evt := ev.byPath["track.mp3"]
+	if evt == nil {
+		t.Fatal("nothing published")
+	}
+	entry, err := nostrevent.Parse(evt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := hashHex([]byte("retagged bytes")); entry.Sha256 != want {
+		t.Errorf("published sha256 = %s, want %s (the bytes uploaded)", entry.Sha256, want)
+	}
+
+	// Which is what lets another device actually receive it.
+	rootB := t.TempDir()
+	engB := newEngine(t, rootB, id, ev, bl)
+	if err := engB.Sync(context.Background()); err != nil {
+		t.Fatalf("B sync: %v", err)
+	}
+	if got, ok := readFile(t, rootB, "track.mp3"); !ok || got != "retagged bytes" {
+		t.Errorf("B has %q (present=%v), want %q", got, ok, "retagged bytes")
 	}
 }
 

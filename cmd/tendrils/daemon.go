@@ -73,8 +73,11 @@ func newDaemonCmd() *cobra.Command {
 				return err
 			}
 
-			// Blossom multi-server mirroring is out of v1 scope; use the first.
-			blobs := blob.New(cfg.BlossomServers[0], id)
+			// Every configured server, in preference order: the first that answers
+			// wins. Order matters — a LAN server ahead of a proxied public one lets
+			// large files skip the proxy's request-size cap, while a device that
+			// leaves that network keeps syncing by falling through to the next.
+			blobs := blob.NewPool(cfg.BlossomServers, id)
 			eng, err := engine.New(cfg.SyncRoot, id, idx, blobs, relays, log)
 			if err != nil {
 				return err
@@ -95,7 +98,7 @@ func newDaemonCmd() *cobra.Command {
 			fmt.Fprintln(out, "  Identity: ", npub)
 			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot)
 			fmt.Fprintln(out, "  Relays:   ", cfg.Relays)
-			fmt.Fprintln(out, "  Storage:  ", cfg.BlossomServers[0])
+			fmt.Fprintln(out, "  Storage:  ", cfg.BlossomServers)
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
 

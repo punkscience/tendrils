@@ -50,6 +50,37 @@ const authTTL = 60 * time.Second
 // failure it should retry.
 var ErrNotFound = errors.New("blob: not found")
 
+// ErrTooLarge wraps a rejection for the blob's size (HTTP 413). It is almost
+// always a reverse proxy in front of the server, not the server itself — a
+// Cloudflare-fronted host caps request bodies at 100 MB on the free plan. The
+// engine needs to tell it apart from a transient failure because retrying it on
+// the next pass cannot possibly succeed: the same bytes will be refused again.
+var ErrTooLarge = errors.New("blob: too large for server")
+
+// maxErrBody caps how much of a server's error body is quoted back in an error.
+const maxErrBody = 200
+
+// maxIdleConns is how many connections the client keeps warm per Blossom server.
+// Sized for the most concurrent callers any command uses (the blob sweep), so
+// connection reuse is the rule rather than the exception.
+const maxIdleConns = 16
+
+// detail renders a server error body as a short suffix for an error message, or
+// "" when there is nothing worth quoting. Proxies answer failures with a full
+// HTML error page whose only real information is the status line we already
+// report, so those are dropped — quoting one whole turned every rejected upload
+// into kilobytes of log.
+func detail(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if s == "" || strings.Contains(strings.ToLower(s), "<html") {
+		return ""
+	}
+	if len(s) > maxErrBody {
+		s = s[:maxErrBody] + "…"
+	}
+	return ": " + s
+}
+
 // Descriptor is a Blossom server's record of a stored blob (BUD-02).
 type Descriptor struct {
 	// URL is the server-provided direct URL to the blob.
@@ -85,7 +116,14 @@ func New(server string, id *keys.Identity) *Client {
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          10,
+		MaxIdleConns:          maxIdleConns,
+		// Go's default is 2 per host, which quietly throttles any caller that runs
+		// more than two requests at once: the extra connections are closed after
+		// each response and every following request pays a fresh dial. Against a
+		// small home server that measured ~250 ms per request (an mDNS lookup plus
+		// a slow accept), which dominated everything else for small blobs. Keeping
+		// one idle connection per concurrent caller makes reuse the normal case.
+		MaxIdleConnsPerHost: maxIdleConns,
 	}
 	return NewWithHTTP(server, id, &http.Client{Transport: transport})
 }
@@ -121,8 +159,12 @@ func (c *Client) Upload(ctx context.Context, data []byte) (Descriptor, error) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return Descriptor{}, fmt.Errorf("blob: %s refused %d bytes as too large (%s)%s: %w",
+			c.server, len(data), resp.Status, detail(body), ErrTooLarge)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Descriptor{}, fmt.Errorf("blob: upload rejected (%s): %s", resp.Status, strings.TrimSpace(string(body)))
+		return Descriptor{}, newStatusError(resp.StatusCode, "blob: upload rejected (%s)%s", resp.Status, detail(body))
 	}
 
 	var d Descriptor
@@ -161,7 +203,7 @@ func (c *Client) Download(ctx context.Context, sha256 string) ([]byte, error) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return nil, fmt.Errorf("blob: download failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))
+		return nil, newStatusError(resp.StatusCode, "blob: download failed (%s)%s", resp.Status, detail(msg))
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -174,8 +216,21 @@ func (c *Client) Download(ctx context.Context, sha256 string) ([]byte, error) {
 	return data, nil
 }
 
-// Has reports whether the server holds the blob at sha256, via a HEAD request.
-func (c *Client) Has(ctx context.Context, sha256 string) (bool, error) {
+// Has reports whether the server holds the blob at sha256 *and* that it is
+// wantSize bytes long, via a HEAD request.
+//
+// The size is not decoration. Callers use Has to skip an upload the server does
+// not need, so a false positive does not cost bandwidth — it silently abandons
+// the file: the blob is never repaired, every later pass skips it again, and the
+// publishing device reports success. A server that leaves a truncated blob at a
+// real content address (an earlier blossomd did exactly this when its disk filled)
+// turns one transient error into permanent, invisible data loss.
+//
+// So this is deliberately conservative. A missing or unparseable Content-Length
+// counts as "not present", and the caller re-uploads. Re-sending bytes the server
+// already has is harmless — it is the same content address either way — and is
+// the cheaper mistake by a wide margin.
+func (c *Client) Has(ctx context.Context, sha256 string, wantSize int64) (bool, error) {
 	auth, err := c.authHeader("get", sha256)
 	if err != nil {
 		return false, err
@@ -197,10 +252,85 @@ func (c *Client) Has(ctx context.Context, sha256 string) (bool, error) {
 	case resp.StatusCode == http.StatusNotFound:
 		return false, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		if resp.ContentLength != wantSize {
+			// Present but the wrong length: the address cannot describe these bytes.
+			// Report absent so the caller overwrites it rather than trusting it.
+			return false, nil
+		}
 		return true, nil
 	default:
-		return false, fmt.Errorf("blob: head failed (%s)", resp.Status)
+		return false, newStatusError(resp.StatusCode, "blob: head failed (%s)", resp.Status)
 	}
+}
+
+// Stored is one blob the server holds, as reported by List.
+type Stored struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	// Uploaded is when the *server* stored it, not a client-supplied time. A
+	// sweeper needs it to leave recently-written blobs alone, since an upload
+	// whose describing event has not yet propagated is not an orphan.
+	Uploaded int64 `json:"uploaded"`
+}
+
+// List enumerates every blob the server holds. It is what makes orphan
+// collection possible: nothing can decide a blob is unreferenced without first
+// knowing the blob exists.
+func (c *Client) List(ctx context.Context, pubkey string) ([]Stored, error) {
+	auth, err := c.authHeader("list", "")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+"/list/"+pubkey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("blob: build list request: %w", err)
+	}
+	req.Header.Set("Authorization", auth)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("blob: list from %s: %w", c.server, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return nil, newStatusError(resp.StatusCode, "blob: list failed (%s)%s", resp.Status, detail(msg))
+	}
+	var out []Stored
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("blob: parse list response: %w", err)
+	}
+	return out, nil
+}
+
+// Delete removes the blob at sha256. It is idempotent: deleting a blob the server
+// does not have succeeds, so a retried sweep does not fail on its own progress.
+func (c *Client) Delete(ctx context.Context, sha256 string) error {
+	auth, err := c.authHeader("delete", sha256)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.server+"/"+sha256, nil)
+	if err != nil {
+		return fmt.Errorf("blob: build delete request: %w", err)
+	}
+	req.Header.Set("Authorization", auth)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("blob: delete at %s: %w", c.server, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // already gone
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return newStatusError(resp.StatusCode, "blob: delete rejected (%s)%s", resp.Status, detail(msg))
+	}
+	return nil
 }
 
 // authHeader mints a signed BUD-01 authorization for one verb ("upload", "get")

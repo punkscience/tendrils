@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"ca.punkscience.tendrils/internal/config"
+	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/scan"
@@ -75,21 +76,24 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	}
 	defer store.Close()
 
-	last, pending, conflicts, err := computeStatus(store, cfg.SyncRoot)
+	last, stats, err := computeStatus(store, cfg.SyncRoot)
 	if err != nil {
 		return snap, err
 	}
 	snap.LastReconcile = last
-	snap.Pending = pending
-	snap.Conflicts = conflicts
+	snap.Pending = stats.Pending
+	snap.Conflicts = stats.Conflicts
+	snap.Deferred = stats.Deferred
 	return snap, nil
 }
 
 // computeStatus derives, from an open index and the sync root, the last recorded
-// reconcile, how many local files differ from the last-synced base (pending
-// upload/delete), and how many conflict copies await the owner. Its reads are
-// safe to run concurrently with the engine's writes on the same index handle.
-func computeStatus(store *index.Store, root string) (last time.Time, pending, conflicts int, err error) {
+// reconcile and the same outstanding-work counts a daemon pass would report: how
+// many local files differ from the last-synced base (pending upload/delete), how
+// many conflict copies await the owner, and how many paths are waiting out a
+// retry backoff. Its reads are safe to run concurrently with the engine's writes
+// on the same index handle.
+func computeStatus(store *index.Store, root string) (last time.Time, stats engine.Stats, err error) {
 	last, err = store.LastReconcile()
 	if err != nil {
 		return
@@ -97,6 +101,16 @@ func computeStatus(store *index.Store, root string) (last time.Time, pending, co
 	base, err := store.All()
 	if err != nil {
 		return
+	}
+	retries, err := store.Retries()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, r := range retries {
+		if r.NextAttempt.After(now) {
+			stats.Deferred++
+		}
 	}
 	if root == "" {
 		return
@@ -108,11 +122,11 @@ func computeStatus(store *index.Store, root string) (last time.Time, pending, co
 
 	for path, e := range local {
 		if scan.IsConflictCopy(path) {
-			conflicts++
+			stats.Conflicts++
 			continue
 		}
 		if b := base[path]; !tree.SameContent(b, e) {
-			pending++ // new or edited since last sync
+			stats.Pending++ // new or edited since last sync
 		}
 	}
 	for path, b := range base {
@@ -120,7 +134,7 @@ func computeStatus(store *index.Store, root string) (last time.Time, pending, co
 			continue
 		}
 		if _, stillHere := local[path]; !stillHere {
-			pending++ // deleted locally since last sync
+			stats.Pending++ // deleted locally since last sync
 		}
 	}
 	return
@@ -138,6 +152,9 @@ func printStatus(out io.Writer, snap statusSnapshot, daemonRunning bool) {
 	fmt.Fprintln(out, "Last reconcile:", formatTime(snap.LastReconcile))
 	fmt.Fprintln(out, "Pending changes:", snap.Pending)
 	fmt.Fprintln(out, "Conflicts:     ", snap.Conflicts)
+	if snap.Deferred > 0 {
+		fmt.Fprintf(out, "Stuck:           %d (repeatedly failed, waiting out a retry backoff)\n", snap.Deferred)
+	}
 	if snap.LastError != "" {
 		fmt.Fprintln(out, "Last pass error:", snap.LastError)
 	}

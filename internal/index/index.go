@@ -17,8 +17,25 @@ import (
 var (
 	entriesBucket = []byte("entries")
 	metaBucket    = []byte("meta")
+	retriesBucket = []byte("retries")
 	lastReconcile = []byte("last-reconcile")
 )
+
+// Retry is a path's record of consecutive action failures: how many, and the
+// earliest time worth trying again. It exists so one file the server will not
+// accept stops being retried every pass — without it a permanently-rejected
+// upload burns a slot and two log lines a minute, forever.
+//
+// Permanent marks a failure that repeating cannot fix (the server refused the
+// blob outright rather than failing to receive it). Even those get a slow retry
+// rather than being abandoned: what makes them permanent is the server's
+// configuration, and that can change under us.
+type Retry struct {
+	Failures    int       `json:"failures"`
+	NextAttempt time.Time `json:"next_attempt"`
+	LastError   string    `json:"last_error"`
+	Permanent   bool      `json:"permanent"`
+}
 
 // Store is the persistent index. Safe for use from the single sync engine.
 type Store struct {
@@ -32,7 +49,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{entriesBucket, metaBucket} {
+		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -96,6 +113,49 @@ func (s *Store) All() (map[string]*tree.Entry, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("index: all: %w", err)
+	}
+	return out, nil
+}
+
+// SetRetry records a path's failure state, overwriting any prior one.
+func (s *Store) SetRetry(path string, r Retry) error {
+	if path == "" {
+		return fmt.Errorf("index: set retry: no path")
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("index: marshal retry %s: %w", path, err)
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(retriesBucket).Put([]byte(path), data)
+	})
+}
+
+// ClearRetry forgets a path's failure state, called when its action succeeds so
+// the backoff starts from scratch next time rather than from a stale count.
+func (s *Store) ClearRetry(path string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(retriesBucket).Delete([]byte(path))
+	})
+}
+
+// Retries returns every recorded failure state keyed by path. The engine reads
+// them once per pass, like All, so planning costs one transaction rather than a
+// lookup per path.
+func (s *Store) Retries() (map[string]Retry, error) {
+	out := make(map[string]Retry)
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(retriesBucket).ForEach(func(k, v []byte) error {
+			var r Retry
+			if err := json.Unmarshal(v, &r); err != nil {
+				return err
+			}
+			out[string(k)] = r
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("index: retries: %w", err)
 	}
 	return out, nil
 }

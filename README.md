@@ -26,6 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.s
 irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex
 ```
 
+Upgrading an existing fleet — including the one-time repair steps after this
+release — is documented in **[docs/UPGRADING.md](docs/UPGRADING.md)**.
+
 Or build it yourself:
 ```sh
 git clone https://github.com/punkscience/tendrils && cd tendrils

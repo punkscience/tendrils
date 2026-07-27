@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,4 +121,116 @@ func TestParseAllowedFormats(t *testing.T) {
 	if set, err := parseAllowed(""); err != nil || len(set) != 0 {
 		t.Fatalf("empty spec should yield empty set: set=%v err=%v", set, err)
 	}
+}
+
+// A failed write must leave nothing behind. The bug this replaces used
+// os.WriteFile, whose O_CREATE|O_TRUNC succeeds before the write does — so a full
+// disk left an empty file at the blob's real address, the server then answered
+// HEAD for it with 200, and every client skipped re-uploading a blob that held no
+// bytes. Simulated here with an unwritable directory.
+func TestStoreAtomicLeavesNothingOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil { // readable, not writable
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	data := []byte("sealed bytes")
+	h := hexOf(data)
+	if err := storeAtomic(dir, h, data); err == nil {
+		t.Fatal("expected the write to fail on a read-only directory")
+	}
+	if _, err := os.Stat(filepath.Join(dir, h)); !os.IsNotExist(err) {
+		t.Errorf("a file was left at the blob address after a failed write (stat err = %v)", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if ents, err := os.ReadDir(dir); err != nil || len(ents) != 0 {
+		t.Errorf("directory not empty after a failed write: %v (err %v)", ents, err)
+	}
+}
+
+func TestStoreAtomicWritesCompleteBlob(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("sealed bytes")
+	h := hexOf(data)
+	if err := storeAtomic(dir, h, data); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		t.Errorf("stored %q, want %q", got, data)
+	}
+	// Storing again is a no-op, not a rewrite: the address determines the bytes.
+	if err := storeAtomic(dir, h, data); err != nil {
+		t.Errorf("re-store should succeed: %v", err)
+	}
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 1 {
+		t.Errorf("expected exactly one file, got %d — a temp file leaked", len(ents))
+	}
+}
+
+// listBlobs must report only real content addresses. A temp file from an upload
+// in flight is not a blob, and a sweeper that treated one as an orphan would
+// delete a blob mid-write.
+func TestListBlobsIgnoresTempAndBadNames(t *testing.T) {
+	dir := t.TempDir()
+	real := hexOf([]byte("a"))
+	for name, content := range map[string]string{
+		real:                      "a",
+		".tmp-" + real + "-12345": "partial",
+		"not-a-hash":              "x",
+		strings.ToUpper(real):     "uppercase is not our naming",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	blobs, err := listBlobs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 1 {
+		t.Fatalf("listed %d blobs, want 1: %+v", len(blobs), blobs)
+	}
+	if blobs[0].SHA256 != real {
+		t.Errorf("listed %s, want %s", blobs[0].SHA256, real)
+	}
+	if blobs[0].Size != 1 {
+		t.Errorf("size = %d, want 1", blobs[0].Size)
+	}
+	if blobs[0].Uploaded == 0 {
+		t.Error("Uploaded should carry the store's mtime, for the sweeper's grace period")
+	}
+}
+
+func TestIsBlobName(t *testing.T) {
+	valid := hexOf([]byte("x"))
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{valid, true},
+		{strings.ToUpper(valid), false},
+		{valid[:63], false},
+		{valid + "a", false},
+		{".tmp-" + valid + "-9", false},
+		{strings.Repeat("g", 64), false},
+	} {
+		if got := isBlobName(tc.name); got != tc.want {
+			t.Errorf("isBlobName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// hexOf is the content address of data, for tests.
+func hexOf(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
