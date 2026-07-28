@@ -57,11 +57,24 @@ One transient disk-full error became an unrecoverable file, and the pass that di
 
 Three fixes, and all three matter:
 
-- **`storeAtomic`** writes to a temp file in the same directory, fsyncs, and renames. Presence now means the bytes are down. On any failure nothing is left behind to lie about.
+- **`storeStream`** copies the upload to a temp file in the same directory, fsyncs, and renames. Presence now means the bytes are down. On any failure nothing is left behind to lie about. It also hashes as it copies, so the blob is never held in memory — see "Memory is bounded by bytes, not by count" below.
 - **`Has(sha, size)`** takes the expected size and reports absent on a mismatch. Deliberately conservative: a missing `Content-Length` also counts as absent. A needless re-upload costs bandwidth; a wrongly-skipped one abandons the file.
 - **blossomd reports a 0-byte blob as 404** unless the address really is the empty hash, so pre-existing corruption stops lying immediately rather than waiting for a sweep.
 
 The general rule: **never let "it exists" stand in for "it is correct" when the consequence of being wrong is silent and permanent.**
+
+## Memory is bounded by bytes, not by count
+
+Every byte path in this project is `[]byte` — whole file in memory, no streaming — so peak memory tracks *file size × concurrency*, and neither term is small. The reference store holds 6,630 blobs averaging 32 MB with a 412 MB maximum, on a 1.8 GB Raspberry Pi that also runs the relay and the blob server. On 2026-07-27 a GC sweep drove that host to a load average of 71 and a 178% commit ratio; it swap-thrashed onto its SD card, saturated the SDIO bus, and took the SDIO-attached wifi down with it for half an hour. The host never rebooted and never browned out — from outside it looked exactly like a failing PSU, which is the diagnostic trap worth remembering.
+
+Two ceilings now hold it:
+
+- **`blossomd` streams uploads** (`storeStream`). The buffered version called `io.ReadAll` on the request body; `io.ReadAll` grows by reallocate-and-copy, so at the final growth both buffers are live and the peak is ~2× the blob — ~800 MB for the 412 MB blob, and the observed `MemoryPeak` was 796 MB. The cost of streaming is that the content address is unknown until the last byte, so a duplicate upload can no longer skip the write. That is one wasted temp file against a ceiling that does not move with the largest file anyone syncs.
+- **GC counts bytes, not workers** (`gc.Options.MaxInFlightBytes`, default 256 MB). Worker count is a useless memory dial when blob sizes span two orders of magnitude: six slots is 390 MB or 4.8 GB purely by draw. A blob larger than the whole budget is admitted alone rather than refused, because refusing it would deadlock the sweep on exactly the blobs most worth reclaiming.
+
+Neither change touches the wire format, the event codec, or blob addressing, so unlike the `created_at` fix this needs no coordinated upgrade — deploy the server where the server runs.
+
+Still `[]byte` and still unbounded by file size: `engine.publishLocal` (`os.ReadFile` then `crypt.Seal`, ~2× the file, but sequential so it is bounded by the largest single file) and `gc.inspect` (`crypt.Open` allocates the plaintext rather than decrypting in place). Streaming `Seal` is not available without changing the sealing format: `crypt.deriveNonce` HMACs the entire plaintext to derive the deterministic nonce, so no ciphertext byte can be emitted until the whole file has been read. Chunked sealing with per-chunk nonces would fix that and the oversized-file 413 problem together, at the price of a format migration.
 
 ## Blob GC: refuse rather than guess
 

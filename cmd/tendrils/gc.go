@@ -25,6 +25,7 @@ func newGCCmd() *cobra.Command {
 		trustReferences bool
 		server          string
 		workers         int
+		maxInflightMB   int64
 	)
 
 	cmd := &cobra.Command{
@@ -118,12 +119,13 @@ func newGCCmd() *cobra.Command {
 
 			blobs := blob.New(server, id)
 			opts := gc.Options{
-				Apply:           apply,
-				Grace:           grace,
-				TrustReferences: trustReferences,
-				SymKey:          symKey,
-				Workers:         workers,
-				Required:        required,
+				Apply:            apply,
+				Grace:            grace,
+				TrustReferences:  trustReferences,
+				SymKey:           symKey,
+				Workers:          workers,
+				MaxInFlightBytes: maxInflightMB << 20,
+				Required:         required,
 			}
 			if trustReferences {
 				fmt.Fprintln(out, "Ownership checks DISABLED (--trust-references): every unreferenced blob")
@@ -151,7 +153,9 @@ func newGCCmd() *cobra.Command {
 		"skip per-blob ownership proof; only for a store holding no other identity's blobs")
 	cmd.Flags().StringVar(&server, "server", "", "Blossom server to sweep (default: the first configured)")
 	cmd.Flags().IntVar(&workers, "workers", 0,
-		"concurrent ownership checks; each holds a blob in memory, so lower it on a small host (0 = default)")
+		"concurrent ownership checks (0 = default)")
+	cmd.Flags().Int64Var(&maxInflightMB, "max-inflight-mb", 0,
+		"ceiling on blob bytes held in memory at once; raise it on a large host (0 = default 256)")
 	return cmd
 }
 

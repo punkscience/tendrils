@@ -72,23 +72,17 @@ func main() {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
 			}
-			data, err := io.ReadAll(r.Body)
+			h, n, err := storeStream(dir, r.Body)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			sum := sha256.Sum256(data)
-			h := hex.EncodeToString(sum[:])
-			if err := storeAtomic(dir, h, data); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			log.Printf("PUT /upload -> %s (%d bytes)", h, len(data))
+			log.Printf("PUT /upload -> %s (%d bytes)", h, n)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"url":    fmt.Sprintf("http://%s/%s", r.Host, h),
 				"sha256": h,
-				"size":   len(data),
+				"size":   n,
 			})
 
 		case http.MethodGet, http.MethodHead:
@@ -329,8 +323,9 @@ func isBlobName(name string) bool {
 	return true
 }
 
-// storeAtomic writes data to its content address so that the blob is either
-// absent or complete, never half-written.
+// storeStream copies r to its content address so that the blob is either absent
+// or complete, never half-written, and without ever holding it in memory. It
+// returns the address and the number of bytes stored.
 //
 // The obvious `os.WriteFile(dir/h, data)` is not safe here, and shipping it cost
 // a week of silent corruption. WriteFile opens with O_CREATE|O_TRUNC and *then*
@@ -346,13 +341,24 @@ func isBlobName(name string) bool {
 // rename is atomic within a filesystem, so a reader sees the old state or the new
 // one. On any failure the temp file is removed, leaving nothing behind to lie
 // about.
-func storeAtomic(dir, h string, data []byte) error {
-	if _, err := os.Stat(filepath.Join(dir, h)); err == nil {
-		return nil // already stored; content-addressed, so it is the same bytes
-	}
-	tmp, err := os.CreateTemp(dir, ".tmp-"+h+"-*")
+//
+// Streaming matters as much as atomicity. The first version read the whole upload
+// with io.ReadAll before writing it. io.ReadAll grows its buffer by reallocating
+// and copying, so at the final growth the old and new buffers are both live and
+// the peak is roughly twice the blob — ~800 MB for the 412 MB blob this store
+// holds. On a 1.8 GB host that was enough to drive the machine into swap thrash
+// heavy enough to saturate the SDIO bus and take its wifi down with it. Copying
+// through the hasher into the temp file is O(1) in memory whatever the size.
+//
+// The cost of streaming is that the address is not known until the last byte has
+// been read, so unlike the buffered version this cannot skip the write for a blob
+// already stored. That is one wasted temp file per duplicate upload — rare, since
+// clients ask Has() first — in exchange for a memory ceiling that does not move
+// with the largest file anyone syncs.
+func storeStream(dir string, r io.Reader) (string, int64, error) {
+	tmp, err := os.CreateTemp(dir, ".tmp-upload-*")
 	if err != nil {
-		return err
+		return "", 0, err
 	}
 	name := tmp.Name()
 	defer func() {
@@ -360,18 +366,28 @@ func storeAtomic(dir, h string, data []byte) error {
 		os.Remove(name) // no-op once the rename below has succeeded
 	}()
 
-	if _, err := tmp.Write(data); err != nil {
-		return err
+	sum := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, sum), r)
+	if err != nil {
+		return "", 0, err
+	}
+	h := hex.EncodeToString(sum.Sum(nil))
+
+	if _, err := os.Stat(filepath.Join(dir, h)); err == nil {
+		return h, n, nil // already stored; content-addressed, so it is the same bytes
 	}
 	// Durability before visibility: fsync, then rename. Without the sync a crash
 	// could leave the rename visible with the contents still in page cache.
 	if err := tmp.Sync(); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", 0, err
 	}
-	return os.Rename(name, filepath.Join(dir, h))
+	if err := os.Rename(name, filepath.Join(dir, h)); err != nil {
+		return "", 0, err
+	}
+	return h, n, nil
 }
 
 // authorize enforces the pubkey allowlist for one verb ("upload"/"get"/"delete"). When no

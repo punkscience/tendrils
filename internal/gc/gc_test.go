@@ -594,3 +594,161 @@ func TestMissingFallsBackToKeepSet(t *testing.T) {
 		t.Errorf("missing = %d, want 1", plan.Missing)
 	}
 }
+
+// The byte budget is what stops a sweep from being the process that pushes a
+// small host into swap. Counting workers cannot do it: blob sizes on a real store
+// span two orders of magnitude, so six slots is 390 MB or 4.8 GB depending purely
+// on which blobs are drawn together.
+func TestByteBudgetHoldsCeiling(t *testing.T) {
+	const limit, each = 100, 30
+	b := newByteBudget(limit)
+
+	var mu sync.Mutex
+	var peak int64
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !b.acquire(each) {
+				return
+			}
+			b.mu.Lock()
+			cur := b.inUse
+			b.mu.Unlock()
+			mu.Lock()
+			if cur > peak {
+				peak = cur
+			}
+			mu.Unlock()
+			time.Sleep(time.Millisecond)
+			b.release(each)
+		}()
+	}
+	wg.Wait()
+
+	if peak > limit {
+		t.Errorf("peak in flight %d bytes, limit %d", peak, limit)
+	}
+	if b.inUse != 0 {
+		t.Errorf("budget leaked %d bytes", b.inUse)
+	}
+}
+
+// A blob bigger than the entire budget must still be swept, alone. Refusing it
+// would deadlock the sweep on exactly the blobs most worth reclaiming.
+func TestByteBudgetAdmitsOversizedBlobAlone(t *testing.T) {
+	b := newByteBudget(100)
+	if !b.acquire(500) {
+		t.Fatal("an over-budget blob must still be admitted")
+	}
+
+	joined := make(chan bool, 1)
+	go func() { joined <- b.acquire(10) }()
+	select {
+	case <-joined:
+		t.Fatal("a second check ran alongside an over-budget blob")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	b.release(500)
+	select {
+	case ok := <-joined:
+		if !ok {
+			t.Error("acquire should succeed once the budget frees")
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("acquire never woke after release")
+	}
+}
+
+// A cancelled sweep must not leave workers parked on a budget nothing will
+// release.
+func TestByteBudgetCloseUnblocksWaiters(t *testing.T) {
+	b := newByteBudget(100)
+	if !b.acquire(100) {
+		t.Fatal("first acquire should fit")
+	}
+
+	waited := make(chan bool, 1)
+	go func() { waited <- b.acquire(50) }()
+	time.Sleep(20 * time.Millisecond) // let it park on the condition
+
+	b.close()
+	select {
+	case ok := <-waited:
+		if ok {
+			t.Error("acquire should report failure once the budget is closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("close did not wake the waiter")
+	}
+}
+
+// trackingStore records the peak concurrent blob bytes a sweep has outstanding,
+// so the ceiling can be asserted rather than assumed. It under-counts slightly —
+// the budget is held across Download *and* crypt.Open, while this releases when
+// Download returns — so peak <= ceiling here is a necessary condition, not the
+// full picture.
+type trackingStore struct {
+	*fakeStore
+	mu       sync.Mutex
+	inFlight int64
+	peak     int64
+}
+
+func (s *trackingStore) Download(ctx context.Context, addr string) ([]byte, error) {
+	data, err := s.fakeStore.Download(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	cost := int64(len(data)) * inspectOverhead
+
+	s.mu.Lock()
+	s.inFlight += cost
+	if s.inFlight > s.peak {
+		s.peak = s.inFlight
+	}
+	s.mu.Unlock()
+
+	time.Sleep(2 * time.Millisecond) // hold long enough that overlap is observable
+
+	s.mu.Lock()
+	s.inFlight -= cost
+	s.mu.Unlock()
+	return data, nil
+}
+
+func TestSweepRespectsMemoryCeiling(t *testing.T) {
+	ours := mustKey(t)
+	st := &trackingStore{fakeStore: newFakeStore()}
+
+	const nBlobs = 24
+	body := strings.Repeat("x", 4096)
+	var sealedLen int64
+	for i := 0; i < nBlobs; i++ {
+		a, b := seal(t, ours, fmt.Sprintf("%s-%d", body, i))
+		st.put(a, b, old)
+		sealedLen = int64(len(b))
+	}
+	total := st.count()
+
+	// Room for about two checks at a time, against the six default workers.
+	ceiling := sealedLen * inspectOverhead * 2
+	plan, err := Sweep(context.Background(), st, "pub", map[string]struct{}{}, 0,
+		Options{Apply: true, SymKey: ours, Now: now, MaxInFlightBytes: ceiling})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if st.peak > ceiling {
+		t.Errorf("peak in flight %d bytes exceeds the %d ceiling", st.peak, ceiling)
+	}
+	// Bounding memory must not cost correctness: every blob is still swept.
+	if plan.Orphans != total {
+		t.Errorf("orphans = %d, want %d", plan.Orphans, total)
+	}
+	if plan.Deleted != total {
+		t.Errorf("deleted = %d, want %d", plan.Deleted, total)
+	}
+}

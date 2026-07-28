@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -128,7 +130,7 @@ func TestParseAllowedFormats(t *testing.T) {
 // disk left an empty file at the blob's real address, the server then answered
 // HEAD for it with 200, and every client skipped re-uploading a blob that held no
 // bytes. Simulated here with an unwritable directory.
-func TestStoreAtomicLeavesNothingOnFailure(t *testing.T) {
+func TestStoreStreamLeavesNothingOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o500); err != nil { // readable, not writable
 		t.Fatal(err)
@@ -137,7 +139,7 @@ func TestStoreAtomicLeavesNothingOnFailure(t *testing.T) {
 
 	data := []byte("sealed bytes")
 	h := hexOf(data)
-	if err := storeAtomic(dir, h, data); err == nil {
+	if _, _, err := storeStream(dir, bytes.NewReader(data)); err == nil {
 		t.Fatal("expected the write to fail on a read-only directory")
 	}
 	if _, err := os.Stat(filepath.Join(dir, h)); !os.IsNotExist(err) {
@@ -151,12 +153,21 @@ func TestStoreAtomicLeavesNothingOnFailure(t *testing.T) {
 	}
 }
 
-func TestStoreAtomicWritesCompleteBlob(t *testing.T) {
+func TestStoreStreamWritesCompleteBlob(t *testing.T) {
 	dir := t.TempDir()
 	data := []byte("sealed bytes")
 	h := hexOf(data)
-	if err := storeAtomic(dir, h, data); err != nil {
+	gotHash, n, err := storeStream(dir, bytes.NewReader(data))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The address is derived from the bytes that actually landed, not supplied by
+	// the caller: a client cannot file content under an address it does not hash to.
+	if gotHash != h {
+		t.Errorf("stored under %s, want %s", gotHash, h)
+	}
+	if n != int64(len(data)) {
+		t.Errorf("reported %d bytes, want %d", n, len(data))
 	}
 	got, err := os.ReadFile(filepath.Join(dir, h))
 	if err != nil {
@@ -166,7 +177,7 @@ func TestStoreAtomicWritesCompleteBlob(t *testing.T) {
 		t.Errorf("stored %q, want %q", got, data)
 	}
 	// Storing again is a no-op, not a rewrite: the address determines the bytes.
-	if err := storeAtomic(dir, h, data); err != nil {
+	if _, _, err := storeStream(dir, bytes.NewReader(data)); err != nil {
 		t.Errorf("re-store should succeed: %v", err)
 	}
 	ents, _ := os.ReadDir(dir)
@@ -174,6 +185,25 @@ func TestStoreAtomicWritesCompleteBlob(t *testing.T) {
 		t.Errorf("expected exactly one file, got %d — a temp file leaked", len(ents))
 	}
 }
+
+// A read that fails partway must not leave a blob behind. The streaming version
+// writes as it reads, so unlike the buffered one it has already put bytes on disk
+// by the time it learns the upload was truncated — and those bytes hash to an
+// address the client never intended.
+func TestStoreStreamLeavesNothingOnTruncatedBody(t *testing.T) {
+	dir := t.TempDir()
+	r := io.MultiReader(bytes.NewReader([]byte("half a blob")), errReader{})
+	if _, _, err := storeStream(dir, r); err == nil {
+		t.Fatal("expected a read error to propagate")
+	}
+	if ents, err := os.ReadDir(dir); err != nil || len(ents) != 0 {
+		t.Errorf("directory not empty after a truncated upload: %v (err %v)", ents, err)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 // listBlobs must report only real content addresses. A temp file from an upload
 // in flight is not a blob, and a sweeper that treated one as an orphan would

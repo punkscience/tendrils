@@ -97,9 +97,17 @@ type Options struct {
 	// reclamation as data loss. Nil falls back to the keep-set.
 	Required map[string]struct{}
 	// Workers is how many ownership checks run at once. Zero uses ownerWorkers.
-	// Each in-flight check holds a whole blob and its plaintext in memory, so on a
-	// small machine this is a memory dial as much as a speed one.
 	Workers int
+	// MaxInFlightBytes caps the total memory the ownership checks may hold at
+	// once. Zero uses defaultMaxInFlightBytes.
+	//
+	// Workers alone is a bad memory dial because it counts blobs, and blobs vary
+	// by two orders of magnitude. On the author's store the mean is 32 MB and the
+	// largest is 412 MB, so six workers is either ~390 MB or ~4.8 GB depending
+	// entirely on which blobs happen to be drawn together — and the 4.8 GB case on
+	// a 1.8 GB host is what took the machine down. Counting bytes makes the ceiling
+	// hold whatever the draw.
+	MaxInFlightBytes int64
 }
 
 // Plan is what a sweep found, and what it did if Apply was set.
@@ -241,10 +249,71 @@ func Sweep(ctx context.Context, store Store, pubkey string, live map[string]stru
 
 // ownerWorkers is the default number of concurrent ownership checks. Proving
 // ownership means reading the blob, so a handful of readers lets the disk
-// scheduler coalesce and reorder seeks. Each worker holds a whole blob plus its
-// decrypted plaintext, so raising it costs memory proportional to the largest
-// blobs — which is why Options.Workers exists for small hosts.
+// scheduler coalesce and reorder seeks.
 const ownerWorkers = 6
+
+// defaultMaxInFlightBytes is the default ceiling on blob bytes held at once.
+// Sized for the smallest host this is expected to sweep — a 1.8 GB Raspberry Pi
+// also running a relay and a blob server — rather than for throughput. A bigger
+// machine can raise it; the point of the default is that the sweep cannot be the
+// thing that pushes a small one into swap.
+const defaultMaxInFlightBytes = 256 << 20
+
+// inspectOverhead is what one ownership check costs in memory per byte of blob:
+// the sealed bytes arrive whole from the store, and crypt.Open allocates the
+// plaintext separately rather than decrypting in place.
+const inspectOverhead = 2
+
+// byteBudget is a semaphore counting bytes rather than slots.
+//
+// A blob larger than the whole budget is admitted anyway, but only when nothing
+// else is in flight. Refusing it outright would deadlock the sweep on exactly the
+// blobs that most need reclaiming, and serialising it is the honest reading of a
+// budget it cannot fit inside.
+type byteBudget struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	limit  int64
+	inUse  int64
+	closed bool
+}
+
+func newByteBudget(limit int64) *byteBudget {
+	b := &byteBudget{limit: limit}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+// acquire blocks until n bytes fit, reporting false if the budget was closed
+// while waiting.
+func (b *byteBudget) acquire(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for !b.closed && b.inUse > 0 && b.inUse+n > b.limit {
+		b.cond.Wait()
+	}
+	if b.closed {
+		return false
+	}
+	b.inUse += n
+	return true
+}
+
+func (b *byteBudget) release(n int64) {
+	b.mu.Lock()
+	b.inUse -= n
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+// close wakes every waiter so a cancelled sweep does not leave workers parked on
+// a budget nothing will release.
+func (b *byteBudget) close() {
+	b.mu.Lock()
+	b.closed = true
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
 
 // sweepOwned proves ownership of each candidate and deletes the ones that are
 // ours. Reads run concurrently, and the plan is updated from a single goroutine
@@ -264,6 +333,16 @@ func sweepOwned(ctx context.Context, store Store, candidates []blob.Stored, opts
 	if workers < 1 {
 		workers = ownerWorkers
 	}
+	limit := opts.MaxInFlightBytes
+	if limit < 1 {
+		limit = defaultMaxInFlightBytes
+	}
+	// Workers bound how many reads the disk sees at once; the budget bounds how
+	// much memory they may hold between them. Both are needed: the budget alone
+	// would let a thousand tiny blobs run concurrently, and the worker count alone
+	// cannot see that six large ones do not fit.
+	budget := newByteBudget(limit)
+	defer context.AfterFunc(ctx, budget.close)()
 
 	jobs := make(chan blob.Stored)
 	results := make(chan verdict)
@@ -273,7 +352,12 @@ func sweepOwned(ctx context.Context, store Store, candidates []blob.Stored, opts
 		go func() {
 			defer wg.Done()
 			for b := range jobs {
+				cost := b.Size * inspectOverhead
+				if !budget.acquire(cost) {
+					return // sweep cancelled
+				}
 				ours, corrupt, err := inspect(ctx, store, b, opts.SymKey)
+				budget.release(cost)
 				select {
 				case results <- verdict{b: b, ours: ours, corrupt: corrupt, err: err}:
 				case <-ctx.Done():
