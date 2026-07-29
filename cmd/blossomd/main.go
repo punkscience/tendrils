@@ -21,6 +21,13 @@
 //	BLOSSOM_DIR              blob storage directory (default ./blobs)
 //	BLOSSOM_ALLOWED_PUBKEYS  comma-separated npub/hex pubkeys allowed to
 //	                         upload, fetch, and delete; empty = open (no auth)
+//	BLOSSOM_GET_ACCESS       who may GET/HEAD a blob when an allowlist is set:
+//	                         "allowlist" (default) only listed keys;
+//	                         "signed" any valid signed get authorization,
+//	                         whoever signed it; "open" anonymous.
+//	                         /list, upload, and delete always require a
+//	                         listed key. See authorizeGet for why "signed"
+//	                         exists.
 package main
 
 import (
@@ -56,6 +63,12 @@ func main() {
 	allowed, err := parseAllowed(os.Getenv("BLOSSOM_ALLOWED_PUBKEYS"))
 	if err != nil {
 		log.Fatalf("BLOSSOM_ALLOWED_PUBKEYS: %v", err)
+	}
+	getAccess := envOr("BLOSSOM_GET_ACCESS", "allowlist")
+	switch getAccess {
+	case "allowlist", "signed", "open":
+	default:
+		log.Fatalf("BLOSSOM_GET_ACCESS: %q (want allowlist, signed, or open)", getAccess)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Fatal(err)
@@ -116,7 +129,7 @@ func main() {
 				return
 			}
 
-			if err := authorize(r, allowed, "get"); err != nil {
+			if err := authorizeGet(r, allowed, getAccess); err != nil {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
 			}
@@ -184,7 +197,7 @@ func main() {
 	if len(allowed) == 0 {
 		log.Printf("blossomd listening on %s, dir=%s (AUTH OFF — open server, keep off the public internet)", addr, dir)
 	} else {
-		log.Printf("blossomd listening on %s, dir=%s (auth on, %d allowed key(s))", addr, dir, len(allowed))
+		log.Printf("blossomd listening on %s, dir=%s (auth on, %d allowed key(s), get=%s)", addr, dir, len(allowed), getAccess)
 	}
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
@@ -399,38 +412,75 @@ func authorize(r *http.Request, allowed map[string]struct{}, verb string) error 
 	if len(allowed) == 0 {
 		return nil
 	}
+	pub, err := verifyAuth(r, verb)
+	if err != nil {
+		return err
+	}
+	if _, ok := allowed[pub]; !ok {
+		return fmt.Errorf("pubkey not allowed")
+	}
+	return nil
+}
+
+// authorizeGet gates blob GET/HEAD according to policy. Blob fetch has its own
+// policy because gating it on the upload allowlist breaks the store's real
+// consumers: blobs here are shared with recipients whose pubkeys the server has
+// never heard of (an Earmark channel member is told the blob's address and
+// decryption key inside a gift wrap — the server is not part of that
+// introduction, so it cannot have their key listed). The blobs are ciphertext
+// at unguessable content addresses; secrecy comes from the encryption key in
+// the wrap, not from this check. "signed" still demands a validly signed,
+// unexpired get authorization — worthless as identity (anyone can mint a key)
+// but it keeps casual crawlers out and puts a stable pubkey in hand if one
+// signer ever needs banning. Upload, delete, and /list stay on the allowlist:
+// those can destroy or enumerate, a GET can only read one address it already
+// knows.
+func authorizeGet(r *http.Request, allowed map[string]struct{}, policy string) error {
+	switch policy {
+	case "open":
+		return nil
+	case "signed":
+		_, err := verifyAuth(r, "get")
+		return err
+	default:
+		return authorize(r, allowed, "get")
+	}
+}
+
+// verifyAuth checks the BUD-01 "Nostr <base64-event>" Authorization header on r
+// — kind, signature, verb tag, expiration — and returns the signer's lowercase
+// hex pubkey. It deliberately says nothing about whether that pubkey is
+// *allowed*; callers decide what the identity is worth.
+func verifyAuth(r *http.Request, verb string) (string, error) {
 	raw := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !strings.HasPrefix(raw, "Nostr ") {
-		return fmt.Errorf("missing Nostr authorization")
+		return "", fmt.Errorf("missing Nostr authorization")
 	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, "Nostr "))
 	if err != nil {
-		return fmt.Errorf("malformed authorization")
+		return "", fmt.Errorf("malformed authorization")
 	}
 	var evt nostr.Event
 	if err := json.Unmarshal(decoded, &evt); err != nil {
-		return fmt.Errorf("malformed authorization event")
+		return "", fmt.Errorf("malformed authorization event")
 	}
 	if evt.Kind != authKind {
-		return fmt.Errorf("wrong authorization kind")
-	}
-	if _, ok := allowed[strings.ToLower(evt.PubKey)]; !ok {
-		return fmt.Errorf("pubkey not allowed")
+		return "", fmt.Errorf("wrong authorization kind")
 	}
 	ok, err := evt.CheckSignature()
 	if err != nil || !ok {
-		return fmt.Errorf("invalid authorization signature")
+		return "", fmt.Errorf("invalid authorization signature")
 	}
 	if t := evt.Tags.GetFirst([]string{"t"}); t == nil || t.Value() != verb {
-		return fmt.Errorf("authorization not valid for %s", verb)
+		return "", fmt.Errorf("authorization not valid for %s", verb)
 	}
 	if exp := evt.Tags.GetFirst([]string{"expiration"}); exp != nil {
 		secs, err := strconv.ParseInt(exp.Value(), 10, 64)
 		if err != nil || time.Now().Unix() > secs {
-			return fmt.Errorf("authorization expired")
+			return "", fmt.Errorf("authorization expired")
 		}
 	}
-	return nil
+	return strings.ToLower(evt.PubKey), nil
 }
 
 // parseAllowed builds the set of allowed hex pubkeys from a comma-separated list

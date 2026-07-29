@@ -105,6 +105,63 @@ func TestAuthorizeRejectsMissingHeader(t *testing.T) {
 	}
 }
 
+// The "signed" get policy exists for recipients the allowlist has never heard
+// of: any validly signed, unexpired get authorization is enough, whoever
+// signed it.
+func TestAuthorizeGetSignedAcceptsUnlistedKey(t *testing.T) {
+	listedPub, _ := nostr.GetPublicKey(nostr.GeneratePrivateKey())
+	allowed := map[string]struct{}{listedPub: {}}
+
+	strangerSK := nostr.GeneratePrivateKey()
+	r := httptest.NewRequest("GET", "/"+strings.Repeat("a", 64), nil)
+	r.Header.Set("Authorization", mintAuth(t, strangerSK, "get", time.Minute))
+	if err := authorizeGet(r, allowed, "signed"); err != nil {
+		t.Fatalf("signed policy should accept any valid signature: %v", err)
+	}
+}
+
+// "signed" is not "open": the signature, verb, and expiration still have to
+// hold, or the policy degrades to anonymous with extra steps.
+func TestAuthorizeGetSignedStillVerifies(t *testing.T) {
+	sk := nostr.GeneratePrivateKey()
+	for name, header := range map[string]string{
+		"missing header": "",
+		"wrong verb":     mintAuth(t, sk, "upload", time.Minute),
+		"expired":        mintAuth(t, sk, "get", -time.Second),
+	} {
+		r := httptest.NewRequest("GET", "/"+strings.Repeat("a", 64), nil)
+		if header != "" {
+			r.Header.Set("Authorization", header)
+		}
+		if err := authorizeGet(r, nil, "signed"); err == nil {
+			t.Errorf("%s must be rejected under the signed policy", name)
+		}
+	}
+}
+
+func TestAuthorizeGetOpenNeedsNothing(t *testing.T) {
+	listedPub, _ := nostr.GetPublicKey(nostr.GeneratePrivateKey())
+	allowed := map[string]struct{}{listedPub: {}}
+	r := httptest.NewRequest("GET", "/"+strings.Repeat("a", 64), nil)
+	if err := authorizeGet(r, allowed, "open"); err != nil {
+		t.Fatalf("open policy should accept an anonymous get: %v", err)
+	}
+}
+
+// The default policy is the pre-existing behavior: gets gated on the same
+// allowlist as everything else.
+func TestAuthorizeGetDefaultKeepsAllowlist(t *testing.T) {
+	listedPub, _ := nostr.GetPublicKey(nostr.GeneratePrivateKey())
+	allowed := map[string]struct{}{listedPub: {}}
+
+	strangerSK := nostr.GeneratePrivateKey()
+	r := httptest.NewRequest("GET", "/"+strings.Repeat("a", 64), nil)
+	r.Header.Set("Authorization", mintAuth(t, strangerSK, "get", time.Minute))
+	if err := authorizeGet(r, allowed, "allowlist"); err == nil {
+		t.Fatal("allowlist policy must reject an unlisted key")
+	}
+}
+
 func TestParseAllowedFormats(t *testing.T) {
 	sk := nostr.GeneratePrivateKey()
 	pub, _ := nostr.GetPublicKey(sk)
