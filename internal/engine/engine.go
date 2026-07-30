@@ -79,6 +79,7 @@ type Engine struct {
 	log         *slog.Logger
 	report      func(Progress)
 	statsReport func(Stats)
+	chunkSize   int64
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -142,6 +143,8 @@ func New(root string, id *keys.Identity, idx *index.Store, blobs BlobStore, even
 		blobs:  blobs,
 		events: events,
 		log:    log,
+
+		chunkSize: ChunkSize,
 	}, nil
 }
 
@@ -325,6 +328,13 @@ func (e *Engine) execute(ctx context.Context, path string, d reconcile.Decision,
 // event carrying the plaintext identity plus the sealed-blob address.
 func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 	abs := e.abs(local.Path)
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if info.Size() > e.chunkSize {
+		return e.publishLocalChunked(ctx, local, abs)
+	}
 	plaintext, err := os.ReadFile(abs)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
@@ -362,6 +372,125 @@ func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
 	return e.idx.Put(entry)
 }
 
+// ChunkSize is the plaintext span sealed into one blob. A file larger than this
+// is published as an ordered list of chunks instead of a single blob, which
+// bounds memory at roughly twice this figure however large the file is, and
+// keeps every request body well under the 100 MB limit a free Cloudflare zone
+// imposes on the edge in front of the store.
+const ChunkSize = 16 << 20
+
+// publishLocalChunked seals and uploads the file one ChunkSize span at a time,
+// publishing the ordered chunk addresses rather than a single blob address.
+func (e *Engine) publishLocalChunked(ctx context.Context, local *tree.Entry, abs string) error {
+	f, err := os.Open(abs)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	defer f.Close()
+
+	sum := sha256.New()
+	buf := make([]byte, e.chunkSize)
+	var chunks []tree.Chunk
+	var total int64
+
+	for {
+		n, readErr := io.ReadFull(f, buf)
+		if n > 0 {
+			sum.Write(buf[:n])
+			total += int64(n)
+			sealed, err := crypt.Seal(e.symKey, buf[:n])
+			if err != nil {
+				return fmt.Errorf("seal chunk %d: %w", len(chunks)+1, err)
+			}
+			hash, err := e.uploadIfAbsent(ctx, sealed)
+			if err != nil {
+				return fmt.Errorf("chunk %d: %w", len(chunks)+1, err)
+			}
+			chunks = append(chunks, tree.Chunk{BlobHash: hash, Size: int64(len(sealed))})
+		}
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read: %w", readErr)
+		}
+	}
+
+	entry := &tree.Entry{
+		Path:    local.Path,
+		Sha256:  hex.EncodeToString(sum.Sum(nil)),
+		Chunks:  chunks,
+		Size:    total,
+		ModTime: local.ModTime,
+	}
+	if err := e.publish(ctx, entry); err != nil {
+		return err
+	}
+	return e.idx.Put(entry)
+}
+
+// writeRemoteChunked reassembles a chunked file by pulling one chunk at a time
+// into a temp file beside the destination, so peak memory stays near one chunk
+// rather than the whole file. The plaintext hash is accumulated across chunks
+// and checked before anything is put in place: a truncated or reordered chunk
+// list fails the check and the temp file is discarded.
+func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tree.Entry, conflictCopy bool) error {
+	abs := e.abs(path)
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, scan.TempPrefix+"*")
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName) // no-op once the rename below has succeeded
+	}()
+
+	sum := sha256.New()
+	for i, c := range remote.Chunks {
+		sealed, err := e.blobs.Download(ctx, c.BlobHash)
+		if err != nil {
+			if errors.Is(err, blob.ErrNotFound) {
+				return fmt.Errorf("chunk %d of %d (%s…) for %q is not on the configured Blossom server: this device is likely pointed at a different or empty server than the one holding your files — check --blossom / the blossom_servers in your config", i+1, len(remote.Chunks), short(c.BlobHash), path)
+			}
+			return fmt.Errorf("download chunk %d of %d: %w", i+1, len(remote.Chunks), err)
+		}
+		plaintext, err := crypt.Open(e.symKey, sealed)
+		if err != nil {
+			return fmt.Errorf("open chunk %d of %d: %w", i+1, len(remote.Chunks), err)
+		}
+		if _, err := tmp.Write(plaintext); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		sum.Write(plaintext)
+	}
+
+	if got := hex.EncodeToString(sum.Sum(nil)); got != remote.Sha256 {
+		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if !remote.ModTime.IsZero() {
+		if err := os.Chtimes(tmpName, time.Now(), remote.ModTime); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+	if conflictCopy {
+		if err := e.preserveConflictCopy(path); err != nil {
+			return fmt.Errorf("preserve conflict copy: %w", err)
+		}
+	}
+	if err := os.Rename(tmpName, abs); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return e.idx.Put(remote)
+}
+
 // uploadIfAbsent stores sealed and returns its content address, skipping the
 // transfer when the server already holds it. Because sealing is deterministic,
 // two devices that copy in the same file derive the same address, so the second
@@ -394,6 +523,9 @@ func (e *Engine) uploadIfAbsent(ctx context.Context, sealed []byte) (string, err
 // local file carried an unpublished change, it is preserved as a conflict copy
 // first — a wrong last-writer-wins guess then costs a rename, never data.
 func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entry, conflictCopy bool) error {
+	if remote.Chunked() {
+		return e.writeRemoteChunked(ctx, path, remote, conflictCopy)
+	}
 	if remote.BlobHash == "" {
 		return fmt.Errorf("remote entry has no blob address")
 	}

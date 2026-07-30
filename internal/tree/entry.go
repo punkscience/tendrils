@@ -32,6 +32,12 @@ type Entry struct {
 	// entry that has not been sealed and uploaded yet.
 	BlobHash string
 
+	// Chunks carries the sealed parts of a file too large to seal in one piece,
+	// in reassembly order. Empty for a single-blob file, where BlobHash is the
+	// whole content. When non-empty, BlobHash is empty and Sha256 still covers
+	// the reassembled plaintext.
+	Chunks []Chunk
+
 	// Size is the plaintext byte length. Zero for a tombstone.
 	Size int64
 
@@ -45,6 +51,16 @@ type Entry struct {
 	// recoverable in the trash for the retention window.
 	Deleted bool
 }
+
+// Chunk is one sealed part of a chunked file. Size is the sealed byte length,
+// which is what the store's presence check compares against.
+type Chunk struct {
+	BlobHash string
+	Size     int64
+}
+
+// Chunked reports whether e's content is spread across multiple sealed blobs.
+func (e *Entry) Chunked() bool { return e != nil && len(e.Chunks) > 0 }
 
 // Live reports whether e is a present file (non-nil and not a tombstone).
 func (e *Entry) Live() bool { return e != nil && !e.Deleted }

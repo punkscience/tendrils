@@ -69,6 +69,9 @@ func Build(e *tree.Entry) (*nostr.Event, error) {
 		if e.BlobHash != "" {
 			tags = append(tags, nostr.Tag{"blob", e.BlobHash})
 		}
+		for _, c := range e.Chunks {
+			tags = append(tags, nostr.Tag{"chunk", c.BlobHash, strconv.FormatInt(c.Size, 10)})
+		}
 	}
 	return &nostr.Event{
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
@@ -122,6 +125,16 @@ func Parse(evt *nostr.Event) (*tree.Entry, error) {
 	}
 	if s := evt.Tags.GetFirst([]string{"size"}); s != nil {
 		e.Size, _ = strconv.ParseInt(s.Value(), 10, 64)
+	}
+	for _, t := range evt.Tags {
+		if len(t) < 3 || t[0] != "chunk" {
+			continue
+		}
+		size, err := strconv.ParseInt(t[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("nostrevent: chunk %d of %q has unparseable size %q: %w", len(e.Chunks), path, t[2], err)
+		}
+		e.Chunks = append(e.Chunks, tree.Chunk{BlobHash: t[1], Size: size})
 	}
 	return e, nil
 }

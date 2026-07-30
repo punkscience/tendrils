@@ -473,10 +473,19 @@ func (p *Plan) note(msg string) {
 func LiveBlobs(entries []*tree.Entry) map[string]struct{} {
 	live := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
-		if !e.Live() || e.BlobHash == "" {
+		if !e.Live() {
 			continue
 		}
-		live[e.BlobHash] = struct{}{}
+		if e.BlobHash != "" {
+			live[e.BlobHash] = struct{}{}
+		}
+		// A chunked entry's own address is empty; its parts are what the store
+		// holds, and every one of them has to survive the sweep.
+		for _, c := range e.Chunks {
+			if c.BlobHash != "" {
+				live[c.BlobHash] = struct{}{}
+			}
+		}
 	}
 	return live
 }
