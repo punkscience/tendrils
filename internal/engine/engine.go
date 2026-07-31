@@ -162,6 +162,24 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: scan: %w", err)
 	}
+	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
+	// fresh each pass so edits take effect without a restart.
+	ign := e.loadIgnore()
+
+	// Rename anything that cannot exist on every platform before it is published,
+	// so a name only this device can hold never becomes the whole set's problem.
+	// Renaming moves paths, so the scan taken above no longer describes the tree.
+	//
+	// A rename that fails is reported at the end of the pass rather than aborting
+	// it: one file whose name cannot be fixed is no reason to stop syncing the
+	// other thousands, and that file is no worse off than it was before.
+	moved, normErr := e.normalizeNames(local, ign)
+	if moved {
+		if local, err = scan.Tree(e.root, base); err != nil {
+			return fmt.Errorf("engine: rescan after rename: %w", err)
+		}
+	}
+
 	remote, err := e.fetchRemote(ctx)
 	if err != nil {
 		return fmt.Errorf("engine: fetch remote: %w", err)
@@ -170,9 +188,6 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: read retry state: %w", err)
 	}
-	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
-	// fresh each pass so edits take effect without a restart.
-	ign := e.loadIgnore()
 
 	// Plan first, so the total is known before any action runs — that count is
 	// what turns per-file progress into "3 of 12".
@@ -222,6 +237,9 @@ func (e *Engine) Sync(ctx context.Context) error {
 
 	total := len(todo)
 	var errs []error
+	if normErr != nil {
+		errs = append(errs, normErr)
+	}
 	for i, a := range todo {
 		if err := ctx.Err(); err != nil {
 			return err
