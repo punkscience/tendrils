@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -188,6 +189,12 @@ func TestParseAllowedFormats(t *testing.T) {
 // HEAD for it with 200, and every client skipped re-uploading a blob that held no
 // bytes. Simulated here with an unwritable directory.
 func TestStoreStreamLeavesNothingOnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// os.Chmod on Windows only toggles the read-only attribute, which does not
+		// stop file creation inside a directory — the write would simply succeed and
+		// the test would assert nothing.
+		t.Skip("cannot make a directory unwritable via Chmod on Windows")
+	}
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o500); err != nil { // readable, not writable
 		t.Fatal(err)
@@ -268,11 +275,15 @@ func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func TestListBlobsIgnoresTempAndBadNames(t *testing.T) {
 	dir := t.TempDir()
 	real := hexOf([]byte("a"))
+	// Uppercase a *different* hash: on a case-insensitive filesystem (NTFS, APFS)
+	// strings.ToUpper(real) is the same file as real, and whichever the map wrote
+	// last would decide the blob's contents.
+	upper := strings.ToUpper(hexOf([]byte("b")))
 	for name, content := range map[string]string{
 		real:                      "a",
 		".tmp-" + real + "-12345": "partial",
 		"not-a-hash":              "x",
-		strings.ToUpper(real):     "uppercase is not our naming",
+		upper:                     "uppercase is not our naming",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)

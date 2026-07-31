@@ -36,6 +36,19 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# Stop the old daemon before building: Windows refuses to overwrite a running
+# executable, so `go build -o $exe` fails with "Access is denied" while it runs.
+# Stopping here also releases the exclusive bbolt index lock the new process
+# needs. A hard stop is safe — atomic file writes, crash-safe index — and an
+# interrupted pass simply resumes on the next one.
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Write-Host "Removed existing '$taskName' task."
+}
+Get-Process tendrils -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 2
+
 Write-Host "Building tendrils.exe from $repoRoot ..."
 New-Item -ItemType Directory -Force $installDir | Out-Null
 Push-Location $repoRoot
@@ -64,17 +77,6 @@ if (-not $enrolled) {
     Write-Host "then re-run this script."
     exit 1
 }
-
-# Replace any existing task/daemon. The daemon holds an exclusive bbolt index
-# lock, so the old process must be fully gone before the new one starts; a hard
-# stop is safe (atomic file writes, crash-safe index).
-if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host "Removed existing '$taskName' task."
-}
-Get-Process tendrils -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 2
 
 # S4U runs windowless in session 0, so cmd.exe can host the log redirect
 # directly — no hidden-window wrapper needed. ExecutionTimeLimit zero disables

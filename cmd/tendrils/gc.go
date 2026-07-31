@@ -108,9 +108,12 @@ func newGCCmd() *cobra.Command {
 			// published whose event the relay did not return.
 			fromBase := 0
 			for _, e := range base {
-				if e.Live() && e.BlobHash != "" {
-					if _, already := live[e.BlobHash]; !already {
-						live[e.BlobHash] = struct{}{}
+				if !e.Live() {
+					continue
+				}
+				for _, h := range blobAddresses(e) {
+					if _, already := live[h]; !already {
+						live[h] = struct{}{}
 						fromBase++
 					}
 				}
@@ -200,11 +203,30 @@ func readBase(idxPath string) (map[string]*tree.Entry, error) {
 func countLive(base map[string]*tree.Entry) int {
 	n := 0
 	for _, e := range base {
-		if e.Live() && e.BlobHash != "" {
-			n++
+		if e.Live() {
+			n += len(blobAddresses(e))
 		}
 	}
 	return n
+}
+
+// blobAddresses is every address one live entry puts on the server: its single
+// blob, or each of its chunks. A caller that reads only BlobHash misses a
+// chunked file's contents entirely, and in a keep-set that means deleting them.
+func blobAddresses(e *tree.Entry) []string {
+	if e.Chunked() {
+		hs := make([]string, 0, len(e.Chunks))
+		for _, c := range e.Chunks {
+			if c.BlobHash != "" {
+				hs = append(hs, c.BlobHash)
+			}
+		}
+		return hs
+	}
+	if e.BlobHash == "" {
+		return nil
+	}
+	return []string{e.BlobHash}
 }
 
 func printPlan(out io.Writer, p gc.Plan, applied bool) {
