@@ -36,11 +36,20 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# Stop the old daemon before building: Windows refuses to overwrite a running
-# executable, so `go build -o $exe` fails with "Access is denied" while it runs.
-# Stopping here also releases the exclusive bbolt index lock the new process
-# needs. A hard stop is safe — atomic file writes, crash-safe index — and an
-# interrupted pass simply resumes on the next one.
+# Build to a temp name first: a running daemon locks tendrils.exe (image
+# section), so building straight onto it fails on every upgrade — and building
+# before stopping means a broken build leaves the old daemon untouched.
+Write-Host "Building tendrils.exe from $repoRoot ..."
+New-Item -ItemType Directory -Force $installDir | Out-Null
+$newExe = Join-Path $installDir 'tendrils-new.exe'
+Push-Location $repoRoot
+try { go build -o $newExe ./cmd/tendrils; if ($LASTEXITCODE -ne 0) { Write-Error "go build failed"; exit 1 } }
+finally { Pop-Location }
+
+# Replace any existing task/daemon before the binary swap. The daemon holds an
+# exclusive bbolt index lock and its exe is locked while it runs, so the old
+# process must be fully gone first; a hard stop is safe (atomic file writes,
+# crash-safe index).
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
@@ -49,11 +58,7 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 Get-Process tendrils -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
-Write-Host "Building tendrils.exe from $repoRoot ..."
-New-Item -ItemType Directory -Force $installDir | Out-Null
-Push-Location $repoRoot
-try { go build -o $exe ./cmd/tendrils; if ($LASTEXITCODE -ne 0) { Write-Error "go build failed"; exit 1 } }
-finally { Pop-Location }
+Move-Item -Force $newExe $exe
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($userPath -notlike "*$installDir*") {
